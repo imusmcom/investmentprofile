@@ -1,0 +1,15 @@
+# Runtime database, backups, and logs contain private financial data.
+/data/
+/deploy-portfolio.conf
+*.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Local secrets and editor/OS files.
+.env
+**/.env
+.DS_Store
+*.swp
+*.swo
+*~

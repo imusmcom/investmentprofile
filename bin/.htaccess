@@ -1,0 +1,9 @@
+# 只該由 PHP 在檔案系統裡讀取，不該被任何 Web 前端直接送達。
+# nginx 完全不讀 .htaccess，因此這一檔只对 Apache／httpd 生效。
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+</IfModule>

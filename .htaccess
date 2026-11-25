@@ -1,0 +1,11 @@
+# 只在 Apache 的文件根被指到專案根時才有作用（nginx 不讀這一檔）。
+# deploy-bt.sh 與啟動腳本寫著路徑、面板指令與 vhost 名稱，屬部署文件，不該被下載。
+<FilesMatch "\.(sh|bat|md|conf|ini)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>

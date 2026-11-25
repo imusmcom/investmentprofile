@@ -1,0 +1,223 @@
+:root {
+  --bg: #f4f6fa;
+  --panel: #ffffff;
+  --ink: #16202e;
+  --muted: #5f6b7d;
+  --line: #dfe4ec;
+  --gain: #14793c;
+  --loss: #c0342b;
+  --accent: #1f5eff;
+  --warn-bg: #fff6e5;
+  --warn-line: #f0c36d;
+  --ok-bg: #eaf6ee;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  display: flex;
+  align-items: flex-start;
+  min-height: 100vh;
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft JhengHei",
+        "Noto Sans TC", "PingFang TC", Roboto, sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+header.topbar {
+  flex: 0 0 214px;
+  width: 214px;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  height: 100vh;
+  overflow-y: auto;
+  background: #16202e;
+  color: #fff;
+  padding: 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+header.topbar h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .02em; line-height: 1.3; }
+header.topbar .brand-sub { display: block; color: #8b9bb4; font-size: 11px; font-weight: 400; margin-top: 3px; }
+
+nav.main { display: flex; flex-direction: column; gap: 3px; }
+nav.main a {
+  display: block; color: #cfd8e6; padding: 8px 11px; border-radius: 7px; font-size: 14px;
+}
+nav.main a:hover { background: #24324a; color: #fff; text-decoration: none; }
+nav.main a.active { background: var(--accent); color: #fff; }
+
+nav.main .nav-dropdown > summary {
+  display: block; padding: 8px 11px; border-radius: 7px; font-size: 14px;
+  color: #cfd8e6; cursor: pointer; list-style: none; user-select: none;
+}
+nav.main .nav-dropdown > summary::-webkit-details-marker { display: none; }
+nav.main .nav-dropdown > summary::after {
+  content: "▾"; float: right; color: #8b9bb4; transition: transform .15s ease;
+}
+nav.main .nav-dropdown[open] > summary::after { transform: rotate(180deg); }
+nav.main .nav-dropdown > summary:hover,
+nav.main .nav-dropdown[open] > summary { background: #24324a; color: #fff; }
+nav.main .nav-dropdown > summary:focus-visible,
+nav.main .nav-dropdown > a:focus-visible { outline: 2px solid #8fb0ff; outline-offset: 2px; }
+nav.main .nav-dropdown > a.nav-submenu { margin: 3px 0 4px; padding-left: 25px; }
+
+main { flex: 1 1 auto; min-width: 0; max-width: 1280px; margin: 0 auto; padding: 22px; }
+
+.page-title { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 0 0 16px; }
+.page-title h2 { font-size: 21px; margin: 0; }
+.page-title .meta { color: var(--muted); font-size: 13px; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 13px 15px;
+}
+.card .label { color: var(--muted); font-size: 12px; margin-bottom: 5px; letter-spacing: .04em; }
+.card .value { font-size: 21px; font-weight: 660; font-variant-numeric: tabular-nums; }
+.card .sub { font-size: 12px; color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 11px;
+  padding: 16px 18px; margin-bottom: 18px;
+}
+.panel > h3 { margin: 0 0 12px; font-size: 15px; letter-spacing: .02em; }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { padding: 8px 9px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; letter-spacing: .04em; background: #fafbfe; }
+th:first-child, td:first-child, th.left, td.left { text-align: left; }
+tbody tr:hover { background: #f7f9fd; }
+tbody tr.closed { opacity: .65; }
+tfoot td { font-weight: 660; border-top: 2px solid var(--line); border-bottom: none; background: #fafbfe; }
+.num { font-variant-numeric: tabular-nums; }
+/* 靠右的數字欄緊挨著靠左的文字欄時，兩邊的內容都往共用的那條邊界擠，看起來就像同一個東西。
+   不畫線、也不上底色，單純把空白拉寬：數字那側還是靠邊，文字那側明確另起一欄。 */
+.col-gap {
+  padding-left: 32px;
+}
+/* 徽章那幾欄（通道位置）用置中；投資物那欄是文字，還是靠左好讀。 */
+.center { text-align: center; }
+.portfolio-status { width: 200px; padding-left: 32px; padding-right: 32px; text-align: center; }
+.row-actions.portfolio-actions { justify-content: flex-start; padding-left: 12px; }
+/* 交界那一欄只在左側留白會把置中的內容推離正中，右側補同一個距離。 */
+.col-gap.center { padding-right: 32px; }
+.gain { color: var(--gain); }
+.loss { color: var(--loss); }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+
+.table-wrap { overflow-x: auto; }
+.badge {
+  display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+  background: #eef1f7; color: #46536a; border: 1px solid var(--line);
+}
+.badge.buy { background: #e9f1ff; color: #14418f; border-color: #c3d8ff; }
+.badge.sell { background: #fdeceb; color: #8d211b; border-color: #f6c9c5; }
+.badge.manual { background: var(--warn-bg); color: #7a5310; border-color: var(--warn-line); }
+
+.flash { border-radius: 10px; padding: 11px 14px; margin-bottom: 12px; font-size: 14px; }
+.flash.ok { background: var(--ok-bg); border: 1px solid #b9dcc4; color: #155c2d; }
+.flash.warn { background: var(--warn-bg); border: 1px solid var(--warn-line); color: #7a5310; }
+.flash ul { margin: 6px 0 0; padding-left: 20px; }
+
+form.inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+form.inline.manual-price-form { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; }
+.manual-entry { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; }
+.manual-entry input[type=number] { width: 100px; }
+.manual-entry input[type=date] { width: 150px; }
+.manual-actions { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; }
+.manual-quote-date { white-space: nowrap; }
+label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+input, select {
+  font: inherit; padding: 7px 9px; border: 1px solid #c9d1de; border-radius: 7px; background: #fff; color: var(--ink);
+}
+input:focus, select:focus { outline: 2px solid #b9cdff; border-color: var(--accent); }
+input[type=number] { font-variant-numeric: tabular-nums; }
+button {
+  font: inherit; padding: 8px 15px; border-radius: 7px; border: 1px solid var(--accent);
+  background: var(--accent); color: #fff; cursor: pointer;
+}
+button:hover { filter: brightness(1.08); }
+button.ghost, a.ghost {
+  background: #fff; color: #46536a; border-color: #c9d1de;
+}
+/* The 下載 action in the backup list is a link that has to read as a small button. */
+a.ghost { display: inline-block; padding: 3px 9px; font-size: 12px; border: 1px solid #c9d1de; border-radius: 7px; text-decoration: none; }
+button.danger { background: #fff; color: var(--loss); border-color: #eab7b3; }
+button.tiny, a.tiny { padding: 3px 9px; font-size: 12px; }
+
+.grid-forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 16px; }
+/* 瀏覽器縮放會改變 CSS 視窗寬度；桌面固定六欄，窄螢幕才換欄。 */
+.instrument-form-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; }
+.instrument-form-grid .field { min-width: 0; }
+.instrument-form-grid input, .instrument-form-grid select { width: 100%; min-width: 0; }
+.empty { text-align: center; padding: 30px 16px; color: var(--muted); }
+.hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.hint code { background: #eef1f7; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+.row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+footer.foot { color: var(--muted); font-size: 12px; text-align: center; padding: 22px; }
+
+/* 側欄最下方的登入者與登出，桌面推到欄底、窄螢幕自己佔一列。 */
+header.topbar .session {
+  margin-top: auto; padding-top: 12px; border-top: 1px solid #2b3a52;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; color: #9fb0c9;
+}
+header.topbar .session button {
+  background: transparent; color: #cfd8e6; border: 1px solid #3d4f6a;
+  padding: 3px 10px; font-size: 12px;
+}
+header.topbar .session button:hover { background: #24324a; color: #fff; }
+
+/* 登入頁沒有側欄，只有一張置中卡片。 */
+body.login-body { flex-direction: column; align-items: center; padding: 8vh 16px 32px; }
+.login-main { width: 100%; max-width: 430px; margin: 0 auto; padding: 0; flex: none; }
+.login-brand { font-size: 18px; font-weight: 650; text-align: center; margin: 0 0 16px; letter-spacing: .02em; }
+.login-card { padding: 20px; }
+
+/* 樂活圖表：可點列與圖表面板 */
+tr.chart-row { cursor: pointer; }
+tr.chart-row:hover { background: #eef3fb; }
+tr.chart-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; background: #eef3fb; }
+
+#chart-panel { border: 1px solid var(--line); }
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+.chart-box { min-width: 0; }
+.chart-box canvas { width: 100% !important; }
+
+@media (max-width: 720px) {
+  .card .value { font-size: 18px; }
+  .instrument-form-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 480px) {
+  .instrument-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* Narrow screens: navigation goes back across the top so the wide tables keep their room. */
+@media (max-width: 900px) {
+  body { display: block; }
+  header.topbar {
+    width: auto; flex: none; position: static; height: auto; overflow: visible;
+    flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 14px;
+  }
+  header.topbar .brand-sub { display: inline; margin-left: 6px; }
+  nav.main { flex-direction: row; flex-wrap: wrap; gap: 4px; margin-left: auto; }
+  nav.main a { display: inline-block; padding: 6px 12px; }
+  nav.main .nav-dropdown > summary { display: inline-block; padding: 6px 12px; }
+  nav.main .nav-dropdown > a.nav-submenu { margin: 3px 0; padding: 6px 12px 6px 25px; }
+  main { padding: 14px; }
+  header.topbar .session { margin-top: 0; padding-top: 0; border-top: 0; width: 100%; }
+  .chart-grid { grid-template-columns: 1fr; }
+}
