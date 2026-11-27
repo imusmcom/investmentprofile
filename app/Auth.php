@@ -198,9 +198,14 @@ final class Auth
             throw new UserError('新密碼不能跟現在用的相同。');
         }
 
+        $hash = password_hash($new, self::HASH_ALGORITHM, self::HASH_OPTIONS);
+        if (!session_regenerate_id(true)) {
+            throw new \RuntimeException('無法更新登入 session，請重新登入後再試。');
+        }
+
         Database::run(
             'UPDATE access SET password_hash = ? WHERE id = 1',
-            [password_hash($new, self::HASH_ALGORITHM, self::HASH_OPTIONS)]
+            [$hash]
         );
         self::clearThrottle(self::PASSWORD_BUCKET);
 

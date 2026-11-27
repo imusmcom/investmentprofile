@@ -58,7 +58,7 @@ $resetDatabase = static function (): void {
 $seedLegacy = static function (string $dir): PDO {
     mkdir($dir, 0750);
     $pdo = new PDO('sqlite:' . $dir . '/portfolio.sqlite', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    $pdo->exec('CREATE TABLE instruments (id INTEGER PRIMARY KEY)');
+    $pdo->exec("CREATE TABLE instruments (id INTEGER PRIMARY KEY, currency TEXT NOT NULL DEFAULT 'USD')");
     $pdo->exec('CREATE TABLE prices (
         id INTEGER PRIMARY KEY,
         instrument_id INTEGER,
@@ -260,7 +260,7 @@ $labSettings = (int) $pdo->query("SELECT COUNT(*) FROM settings WHERE substr(key
 $transactionCount = (int) $pdo->query('SELECT COUNT(*) FROM transactions')->fetchColumn();
 $cashCount = (int) $pdo->query('SELECT COUNT(*) FROM cash_movements')->fetchColumn();
 
-if ($version !== '8' || $strategyTables !== 0 || $labSettings !== 0 || $remaining !== [[1, '2024-01-01'], [1, '2024-01-02'], [1, '2024-01-03']]
+if ($version !== '9' || $strategyTables !== 0 || $labSettings !== 0 || $remaining !== [[1, '2024-01-01'], [1, '2024-01-02'], [1, '2024-01-03']]
     || $transactionCount !== 1 || $cashCount !== 1
     || $adjColumn !== 1 || $highColumn !== 1 || $lowColumn !== 1 || $exchangeColumn !== 1
     || array_values($primary) !== ['instrument_id', 'as_of']
@@ -296,6 +296,9 @@ $legacyFinancial = $pdo->query("SELECT
     (SELECT amount FROM cash_movements WHERE id = 1)")->fetch(PDO::FETCH_NUM);
 $ok('legacy transaction and cash rows survive the v8 rebuilds',
     $legacyFinancial === ['2024-01-01', 2.0, '2024-01-01', 100.0], json_encode($legacyFinancial));
+$tradeCurrency = (string) $pdo->query('SELECT currency FROM transactions WHERE id = 1')->fetchColumn();
+$ok('v9 backfills each legacy trade with its instrument currency',
+    $tradeCurrency === 'USD', $tradeCurrency);
 $planUses = static function (PDO $db, string $sql, string $index): bool {
     $stmt = $db->prepare('EXPLAIN QUERY PLAN ' . $sql);
     $stmt->execute([1]);
@@ -342,6 +345,12 @@ $ok('v8 rejects impossible transaction and cash dates instead of silently deleti
                    VALUES (1,1,'BUY','2024-02-30',1,1)")
     && $reject($pdo, "INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency)
                    VALUES (1,'2024-02-30','IN',1,'USD')"));
+$ok('v9 transaction currency contract rejects impossible codes and backfills legacy rows',
+    $reject($pdo, "INSERT INTO transactions (portfolio_id,instrument_id,side,traded_on,currency,quantity,price)
+                   VALUES (1,1,'BUY','2025-01-01','X',1,1)")
+    && $reject($pdo, "INSERT INTO transactions (portfolio_id,instrument_id,side,traded_on,currency,quantity,price)
+                   VALUES (1,1,'BUY','2025-01-01','TOOLONG',1,1)")
+    && (int) $pdo->query("SELECT COUNT(*) FROM transactions WHERE currency = ''")->fetchColumn() === 0);
 $pdo = null;
 $resetDatabase();
 
@@ -375,7 +384,7 @@ $probe = null;
 
 $retry = App\Database::pdo();
 $ok('retry after removing injected failure completes migration',
-    (int) $retry->query("SELECT value FROM settings WHERE key='schema_version'")->fetchColumn() === 8
+    (int) $retry->query("SELECT value FROM settings WHERE key='schema_version'")->fetchColumn() === 9
     && (int) $retry->query("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('lab_turtle_runs','lab_turtle_events')")->fetchColumn() === 0
     && (int) $retry->query("SELECT COUNT(*) FROM settings WHERE substr(key,1,4) = 'lab_'")->fetchColumn() === 0
     && (int) $retry->query("SELECT COUNT(*) FROM sqlite_master WHERE name='prices_new'")->fetchColumn() === 0

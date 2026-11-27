@@ -15,9 +15,9 @@
 
 set -euo pipefail
 
-BT_PANEL_DIR="/www/server/panel"
-BT_NGINX_DIR="/www/server/panel/vhost/nginx"
-NGINX_BIN="/www/server/nginx/sbin/nginx"
+BT_PANEL_DIR="${BT_PANEL_DIR:-/www/server/panel}"
+BT_NGINX_DIR="${BT_NGINX_DIR:-/www/server/panel/vhost/nginx}"
+NGINX_BIN="${NGINX_BIN:-/www/server/nginx/sbin/nginx}"
 SITE_DIR="/www/wwwroot/portfolio"
 DATA_DIR=""
 PHP_BIN=""
@@ -31,12 +31,24 @@ REF="main"
 SOURCE=""
 ARCHIVE_SHA256=""
 NO_NGINX=0
+MANAGE_FPM=0
 SKIP_PHP_CONFIG=0
 TMP_DIR=""
 CREATED_SITE=0
 CREATED_DATA=0
 PHP_INI_BACKUP=""
 PHP_INI_CHANGED=0
+FPM_POOL_FILE=""
+FPM_INCLUDE_FILE=""
+FPM_POOL_EXISTED=0
+FPM_INCLUDE_EXISTED=0
+FPM_ROLLBACK_READY=0
+NGINX_CONF_FILE=""
+NGINX_EXT_FILE=""
+NGINX_CONF_EXISTED=0
+NGINX_EXT_EXISTED=0
+NGINX_ROLLBACK_READY=0
+NGINX_DEPLOY_STARTED=0
 INSTALL_COMPLETE=0
 
 usage() {
@@ -73,22 +85,162 @@ log()  { printf '%s\n' "$*"; }
 warn() { printf '警告：%s\n' "$*" >&2; }
 die()  { printf '錯誤：%s\n' "$*" >&2; exit 1; }
 
+# install.sh owns the whole transaction, not just deploy-bt.sh's own validation rollback. Keep
+# private copies before deployment so a later lint/admin failure can restore every managed config,
+# including files created by this run and the main-config includes added to reach them.
+snapshot_managed_file() {
+    local source="$1" snapshot="$2"
+    SNAPSHOT_EXISTED=0
+    if [[ -L "$source" || ( -e "$source" && ! -f "$source" ) ]]; then
+        die "受管理的設定不是一般檔案，拒絕安裝：$source"
+    fi
+    if [[ -f "$source" ]]; then
+        cp -p -- "$source" "$snapshot" || die "無法備份受管理的設定：$source"
+        cmp -s -- "$source" "$snapshot" || die "受管理的設定備份核對失敗：$source"
+        SNAPSHOT_EXISTED=1
+    fi
+}
+
+prepare_fpm_rollback() {
+    (( MANAGE_FPM == 1 )) || return 0
+    FPM_POOL_FILE="$PHP_DIR/etc/portfolio-fpm.conf"
+    FPM_INCLUDE_FILE="$PHP_DIR/etc/php-fpm.conf"
+    [[ -f "$FPM_INCLUDE_FILE" && ! -L "$FPM_INCLUDE_FILE" ]] \
+        || die "PHP-FPM 主設定不存在或是符號連結，拒絕安裝：$FPM_INCLUDE_FILE"
+    mkdir -p -- "$TMP_DIR/fpm-rollback"
+    snapshot_managed_file "$FPM_POOL_FILE" "$TMP_DIR/fpm-rollback/pool.conf"
+    FPM_POOL_EXISTED="$SNAPSHOT_EXISTED"
+    snapshot_managed_file "$FPM_INCLUDE_FILE" "$TMP_DIR/fpm-rollback/php-fpm.conf"
+    FPM_INCLUDE_EXISTED="$SNAPSHOT_EXISTED"
+    FPM_ROLLBACK_READY=1
+}
+
+prepare_nginx_rollback() {
+    (( NO_NGINX == 0 )) || return 0
+    NGINX_CONF_FILE="$CONF"
+    [[ -f "$NGINX_CONF_FILE" && ! -L "$NGINX_CONF_FILE" ]] \
+        || die "Nginx 站台設定不存在或是符號連結，拒絕安裝：$NGINX_CONF_FILE"
+    mkdir -p -- "$TMP_DIR/nginx-rollback"
+    snapshot_managed_file "$NGINX_CONF_FILE" "$TMP_DIR/nginx-rollback/site.conf"
+    NGINX_CONF_EXISTED="$SNAPSHOT_EXISTED"
+
+    local extension_dir
+    extension_dir="$(sed -E 's/[[:space:]]*#.*$//' "$NGINX_CONF_FILE" 2>/dev/null \
+        | grep -m1 -oE 'include[[:space:]]+[^;]*/extension/[^;/]+/\*\.conf' \
+        | sed -E 's/^include[[:space:]]+//; s#/\*\.conf$##' || true)"
+    if [[ -n "$extension_dir" ]]; then
+        [[ "$extension_dir" = /* ]] || extension_dir="$PWD/$extension_dir"
+        extension_dir="${extension_dir%/}"
+        [[ ! -L "$extension_dir" ]] || die "Nginx extension 目錄是符號連結，拒絕安裝：$extension_dir"
+        if [[ -e "$extension_dir" && ! -d "$extension_dir" ]]; then
+            die "Nginx extension 路徑不是目錄，拒絕安裝：$extension_dir"
+        fi
+        NGINX_EXT_FILE="$extension_dir/portfolio-deploy.conf"
+        snapshot_managed_file "$NGINX_EXT_FILE" "$TMP_DIR/nginx-rollback/extension.conf"
+        NGINX_EXT_EXISTED="$SNAPSHOT_EXISTED"
+    fi
+    NGINX_ROLLBACK_READY=1
+}
+
+restore_managed_file() {
+    local file="$1" snapshot="$2" existed="$3" label="$4"
+    if (( existed == 1 )); then
+        if [[ ! -f "$snapshot" || -L "$snapshot" ]]; then
+            warn "找不到 $label 的安裝前備份，請手動檢查：$file"
+            return 1
+        fi
+        if [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+            warn "$label 被換成符號連結或非一般檔案，拒絕覆蓋：$file"
+            return 1
+        fi
+        if ! cp -p -- "$snapshot" "$file" || ! cmp -s -- "$snapshot" "$file"; then
+            warn "$label 無法精確還原，請手動檢查：$file"
+            return 1
+        fi
+    elif [[ -e "$file" || -L "$file" ]]; then
+        if ! rm -f -- "$file"; then
+            warn "本輪新建的 $label 刪除失敗：$file"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+rollback_fpm() {
+    (( FPM_ROLLBACK_READY == 1 )) || return 0
+    local failed=0
+    # Restore the include before removing a newly created pool, so no managed include is left stale.
+    restore_managed_file "$FPM_INCLUDE_FILE" "$TMP_DIR/fpm-rollback/php-fpm.conf" \
+        "$FPM_INCLUDE_EXISTED" "PHP-FPM 主設定" || failed=1
+    restore_managed_file "$FPM_POOL_FILE" "$TMP_DIR/fpm-rollback/pool.conf" \
+        "$FPM_POOL_EXISTED" "portfolio pool" || failed=1
+    return "$failed"
+}
+
+rollback_nginx() {
+    (( NGINX_ROLLBACK_READY == 1 )) || return 0
+    local failed=0
+    if [[ -n "$NGINX_EXT_FILE" ]]; then
+        restore_managed_file "$NGINX_EXT_FILE" "$TMP_DIR/nginx-rollback/extension.conf" \
+            "$NGINX_EXT_EXISTED" "Nginx extension 片段" || failed=1
+    fi
+    restore_managed_file "$NGINX_CONF_FILE" "$TMP_DIR/nginx-rollback/site.conf" \
+        "$NGINX_CONF_EXISTED" "Nginx 站台設定" || failed=1
+    return "$failed"
+}
+
 cleanup() {
-    local rc=$?
+    local rc=$? fpm_failed=0 nginx_failed=0 ini_failed=0 rollback_failed=0
     trap - EXIT
+    if (( rc != 0 && INSTALL_COMPLETE == 0 )); then
+        rollback_fpm || fpm_failed=1
+        if (( PHP_INI_CHANGED == 1 )) && [[ -n "$PHP_INI_BACKUP" ]]; then
+            if ! cp -p -- "$PHP_INI_BACKUP" "$PHP_INI" \
+                || ! cmp -s -- "$PHP_INI_BACKUP" "$PHP_INI"; then
+                warn "php.ini 無法精確還原，請手動檢查：$PHP_INI"
+                ini_failed=1
+            fi
+        fi
+        rollback_nginx || nginx_failed=1
+
+        # Put restored configuration back into each service before deleting directories that only
+        # this failed install may have created. A failed validation/reload keeps the directories.
+        if (( FPM_ROLLBACK_READY == 1 && fpm_failed == 0 && ini_failed == 0 )) \
+            && [[ -x "$PHP_DIR/sbin/php-fpm" ]]; then
+            if ! "$PHP_DIR/sbin/php-fpm" -tt >/dev/null 2>&1; then
+                warn "PHP-FPM 已還原但設定檢查失敗，請手動檢查"
+                fpm_failed=1
+            elif systemctl is-active --quiet "php-fpm-${PHP_VERSION/./}" 2>/dev/null; then
+                if ! systemctl reload "php-fpm-${PHP_VERSION/./}"; then
+                    warn "PHP-FPM 已還原但重載失敗，請手動重新啟動 PHP"
+                    fpm_failed=1
+                fi
+            fi
+        fi
+        if (( NGINX_ROLLBACK_READY == 1 && NGINX_DEPLOY_STARTED == 1 && nginx_failed == 0 )); then
+            if ! "$NGINX_BIN" -t >/dev/null 2>&1; then
+                warn "Nginx 已還原但設定檢查失敗，請手動檢查"
+                nginx_failed=1
+            elif ! "$NGINX_BIN" -s reload >/dev/null 2>&1; then
+                warn "Nginx 已還原但重載失敗，請手動重新啟動 Nginx"
+                nginx_failed=1
+            fi
+        fi
+
+        (( fpm_failed == 0 && nginx_failed == 0 && ini_failed == 0 )) || rollback_failed=1
+        if (( rollback_failed != 0 )); then
+            warn "設定未完全回復，保留本次建立的程式與資料目錄以避免服務中斷：$SITE_DIR、$DATA_DIR"
+        else
+            if (( CREATED_SITE == 1 )); then
+                rm -rf -- "$SITE_DIR"
+            fi
+            if (( CREATED_DATA == 1 )) && [[ "$DATA_DIR" != "$SITE_DIR"/* ]]; then
+                rm -rf -- "$DATA_DIR"
+            fi
+        fi
+    fi
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
         rm -rf -- "$TMP_DIR"
-    fi
-    if (( rc != 0 && INSTALL_COMPLETE == 0 )); then
-        if (( CREATED_SITE == 1 )); then
-            rm -rf -- "$SITE_DIR"
-        fi
-        if (( CREATED_DATA == 1 )) && [[ "$DATA_DIR" != "$SITE_DIR"/* ]]; then
-            rm -rf -- "$DATA_DIR"
-        fi
-        if (( PHP_INI_CHANGED == 1 )) && [[ -n "$PHP_INI_BACKUP" ]]; then
-            cp -p -- "$PHP_INI_BACKUP" "$PHP_INI"
-        fi
     fi
     exit "$rc"
 }
@@ -196,7 +348,7 @@ if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
     fi
 fi
 
-TMP_DIR="$(mktemp -d /tmp/portfolio-install.XXXXXX)"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/portfolio-install.XXXXXX")"
 
 if [[ -n "$SOURCE" ]]; then
     [[ -d "$SOURCE" ]] || die "源碼目錄不存在：$SOURCE"
@@ -267,7 +419,7 @@ rsync -rltp \
     --exclude='/*.log' \
     "$SOURCE/" "$SITE_DIR/"
 
-mkdir -p -- "$DATA_DIR/backups"
+mkdir -p -- "$DATA_DIR/backups" "$DATA_DIR/sessions"
 chown -R root:root "$SITE_DIR"
 find "$SITE_DIR" -type d -exec chmod 755 {} +
 find "$SITE_DIR" -type f -exec chmod 644 {} +
@@ -275,7 +427,7 @@ find "$SITE_DIR" -type f -exec chmod 644 {} +
 [[ ! -f "$SITE_DIR/install.sh" ]] || chmod 755 "$SITE_DIR/install.sh"
 chown -R "$WWW_USER:$WWW_USER" "$DATA_DIR"
 chmod 750 "$DATA_DIR"
-chmod 700 "$DATA_DIR/backups"
+chmod 700 "$DATA_DIR/backups" "$DATA_DIR/sessions"
 
 if (( SKIP_PHP_CONFIG == 0 )); then
     PHP_INI="$PHP_DIR/etc/php.ini"
@@ -308,17 +460,27 @@ if (( SKIP_PHP_CONFIG == 0 )); then
     fi
 fi
 
+DEPLOY_ARGS=(
+    --apply
+    --site-dir="$SITE_DIR"
+    --data-dir="$DATA_DIR"
+    --php-bin="$PHP_BIN"
+    --user="$WWW_USER"
+    --skip-net
+)
 if (( NO_NGINX == 0 )); then
-    log "套用寶塔 Nginx 設定：$CONF"
-    bash "$SITE_DIR/deploy-bt.sh" \
-        --auto \
-        --conf="$CONF" \
-        --site-dir="$SITE_DIR" \
-        --data-dir="$DATA_DIR" \
-        --php-bin="$PHP_BIN" \
-        --user="$WWW_USER" \
-        --skip-net
+    MANAGE_FPM=1
+    prepare_fpm_rollback
+    prepare_nginx_rollback
+    log "套用寶塔 Nginx 與 PHP-FPM 設定：$CONF"
+    DEPLOY_ARGS+=(--php-etc-dir="$PHP_DIR/etc" --manage-fpm --write-nginx --conf="$CONF")
+else
+    # --php-etc-dir itself enables deploy-bt.sh's FPM management, so omit both FPM switches for
+    # root/CLI installs. DATA_DIR still reaches create-admin and the printed cron command below.
+    log "套用程式設定（--no-nginx：不修改 Nginx／PHP-FPM）"
 fi
+NGINX_DEPLOY_STARTED=1
+bash "$SITE_DIR/deploy-bt.sh" "${DEPLOY_ARGS[@]}"
 
 # 在建立帳號前先檢查所有 PHP 語法，避免留下半安裝狀態。
 while IFS= read -r -d '' file; do
@@ -340,13 +502,13 @@ fi
 if [[ "$WWW_USER" == "root" ]]; then
     warn "--user=root 只用於 CLI／測試；不要在 Nginx 網站使用 root"
     printf '%s' "$password" | \
-        "$PHP_BIN" "$SITE_DIR/bin/create-admin.php" \
+        PORTFOLIO_DATA_DIR="$DATA_DIR" "$PHP_BIN" "$SITE_DIR/bin/create-admin.php" \
         --username="$USERNAME" \
         --password-from-stdin \
         --data-dir="$DATA_DIR"
 else
     printf '%s' "$password" | runuser -u "$WWW_USER" -- \
-        "$PHP_BIN" "$SITE_DIR/bin/create-admin.php" \
+        env PORTFOLIO_DATA_DIR="$DATA_DIR" "$PHP_BIN" "$SITE_DIR/bin/create-admin.php" \
         --username="$USERNAME" \
         --password-from-stdin \
         --data-dir="$DATA_DIR"
@@ -372,4 +534,11 @@ else
     log "尚未設定 Nginx。請在寶塔建立站台，運行目錄設為 $SITE_DIR/public，再執行："
     log "cd $SITE_DIR && bash deploy-bt.sh --auto --conf=/www/server/panel/vhost/nginx/你的域名.conf --skip-net"
 fi
+printf -v cron_site '%q' "$SITE_DIR"
+printf -v cron_php '%q' "$PHP_BIN"
+printf -v cron_data '%q' "$DATA_DIR"
+printf -v cron_log '%q' "$DATA_DIR/refresh.log"
+log "排程（Shell 腳本，環境與 CLI 使用同一資料庫）："
+log "  cd $cron_site && PORTFOLIO_DATA_DIR=$cron_data $cron_php bin/refresh-prices.php --data-dir=$cron_data >> $cron_log 2>&1"
+log "日後更新帳號：cd $cron_site && PORTFOLIO_DATA_DIR=$cron_data $cron_php bin/create-admin.php --username=$USERNAME --data-dir=$cron_data"
 log "下一步：登入 → 設定頁修改密碼 → 上傳並還原舊備份。"

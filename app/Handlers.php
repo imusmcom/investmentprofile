@@ -84,7 +84,8 @@ final class Handlers
 
             $holders = implode(',', array_fill(0, count($ids), '?'));
             $recent = Database::all(
-                "SELECT t.*, i.symbol, i.name, i.market, i.currency, p.name AS portfolio_name
+                "SELECT t.*, i.symbol, i.name, i.market,
+                        COALESCE(NULLIF(t.currency, ''), i.currency) AS currency, p.name AS portfolio_name
                  FROM transactions t
                  JOIN instruments i ON i.id = t.instrument_id
                  JOIN portfolios p ON p.id = t.portfolio_id
@@ -116,7 +117,12 @@ final class Handlers
      */
     private static function dashboardScope(): bool
     {
-        return ($_SESSION['dashboard_scope'] ?? '') === 'all';
+        // 沒有手動選單一組合時，一律顯示所有組合；選過單一組合後才改用該組合。
+        if (($_SESSION['dashboard_scope'] ?? '') === 'all') {
+            return true;
+        }
+
+        return empty($_SESSION['portfolio_id']);
     }
 
     /** 切換範圍是刻意的一次寫入，不讓 GET 或重新整理偷偷改掉目前選擇。 */
@@ -125,6 +131,7 @@ final class Handlers
         $requested = App::input('scope');
         if ($requested === 'all') {
             $_SESSION['dashboard_scope'] = 'all';
+            unset($_SESSION['portfolio_id']);
         } elseif (ctype_digit($requested) && (int) $requested > 0
             && Database::scalar('SELECT COUNT(*) FROM portfolios WHERE id = ?', [(int) $requested], 0) > 0) {
             $id = (int) $requested;
@@ -166,9 +173,12 @@ final class Handlers
                 'balance' => null, 'base_value' => 0.0,
             ];
             $row['balance'] = (float) $r['balance'];
-            $row['base_value'] = !$r['base_ok'] || $row['base_value'] === null
-                ? null
-                : $row['base_value'] + (float) $r['base_value'];
+            if ($r['base_ok'] && $row['base_value'] !== null) {
+                $combined = $row['base_value'] + (float) $r['base_value'];
+                $row['base_value'] = is_finite($combined) ? $combined : null;
+            } else {
+                $row['base_value'] = null;
+            }
             $rows[$r['currency']] = $row;
         }
 
@@ -181,6 +191,10 @@ final class Handlers
                 $complete = false;
             } else {
                 $total += $row['base_value'];
+                if (!is_finite($total)) {
+                    $complete = false;
+                    $total = 0.0;
+                }
             }
         }
 
@@ -262,7 +276,9 @@ final class Handlers
         $pageInput = App::input('page', '1');
         $txPage = ctype_digit($pageInput) ? max(1, min((int) $pageInput, $txPages)) : 1;
         $txOffset = ($txPage - 1) * 100;
-        $sql = 'SELECT t.*, i.symbol, i.name, i.market, i.currency, i.yahoo_symbol, p.name AS portfolio_name
+        $sql = 'SELECT t.*, i.symbol, i.name, i.market,
+                       COALESCE(NULLIF(t.currency, \'\'), i.currency) AS currency,
+                       i.yahoo_symbol, p.name AS portfolio_name
                 FROM transactions t
                 JOIN instruments i ON i.id = t.instrument_id
                 JOIN portfolios p ON p.id = t.portfolio_id '
@@ -342,10 +358,12 @@ final class Handlers
         }
         unset($row);
 
+        $aggregate = self::dashboardScope();
         self::render('portfolios', [
             'title'      => '投資組合',
             'portfolios' => $rows,
-            'active'     => current_portfolio_id(),
+            'aggregate'  => $aggregate,
+            'active'     => $aggregate ? 0 : current_portfolio_id(),
         ]);
     }
 
@@ -358,7 +376,6 @@ final class Handlers
             'rates'  => self::currencyOptions(),
             'quoteEnabled' => Settings::get('quote_source', 'yahoo') !== 'off',
             'quoteEndpoint' => QuoteService::endpoint(),
-            'quoteToken'    => QuoteService::token(),
             'refreshBudget' => Settings::get('quote_refresh_budget_seconds', ''),
             'cooldownLeft'  => QuoteService::cooldownLeft(),
             'lastRefresh'  => Settings::get('last_refresh'),
@@ -541,12 +558,12 @@ final class Handlers
         flash("已新增投資物 {$symbol}（{$yahoo}，{$currency}）。");
 
         if (App::input('auto_quote') === '1') {
-            $result = self::applyQuote((int) Database::pdo()->lastInsertId());
+            $result = QuoteService::fetchAndWrite((int) Database::pdo()->lastInsertId());
             flash($result['ok']
                 ? "已抓到最新價 " . fmt_money($result['price'], $currency) . "（{$result['as_of']}）。"
                 : "自動報價失敗：{$result['error']}。可改用手動輸入價格。", $result['ok'] ? 'ok' : 'warn');
         } else {
-            // applyQuote already refreshes the rate for that symbol; this path never reaches it.
+            // fetchAndWrite already refreshes the rate for that symbol; this path never reaches it.
             self::ensureFxFor($currency);
         }
 
@@ -561,7 +578,7 @@ final class Handlers
         }
 
         if (App::input('action') === 'fetch') {
-            $result = self::applyQuote($id);
+            $result = QuoteService::fetchAndWrite($id);
             flash($result['ok']
                 ? "已更新報價（{$result['as_of']}）。"
                 : "更新失敗：{$result['error']}", $result['ok'] ? 'ok' : 'warn');
@@ -682,9 +699,9 @@ final class Handlers
             }
 
             Database::run(
-                'INSERT INTO transactions (portfolio_id, instrument_id, side, traded_on, quantity, price, fee, note, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [$pid, (int) $instrument['id'], $side, $tradedOn, $quantity, $price, $fee, $note, now_stamp()]
+                'INSERT INTO transactions (portfolio_id, instrument_id, side, traded_on, quantity, price, fee, currency, note, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [$pid, (int) $instrument['id'], $side, $tradedOn, $quantity, $price, $fee, (string) $instrument['currency'], $note, now_stamp()]
             );
 
             try {
@@ -851,11 +868,22 @@ final class Handlers
             throw new UserError('不支援的報價來源。');
         }
 
+        // Never prefill this field from storage. Blank means preserve; clearing requires a separate,
+        // exact opt-in so an older form or an accidental empty submission cannot erase the token.
         $token = App::input('quote_token');
+        $clearToken = self::rawInput('clear_quote_token');
+        if (!in_array($clearToken, ['', '0', '1'], true)) {
+            throw new UserError('清除報價金鑰的選項不正確。');
+        }
+        $clearToken = $clearToken === '1';
+        if ($clearToken && $token !== '') {
+            throw new UserError('要清除報價金鑰，請不要同時填寫新的金鑰。');
+        }
         if (preg_match('/[\x00-\x1F\x7F]/', $token) === 1) {
             throw new UserError('報價金鑰不可包含換行或其他控制字元。');
         }
-        $normalised = QuoteService::normaliseEndpoint(App::input('quote_endpoint'), $token);
+        $effectiveToken = $clearToken ? '' : ($token !== '' ? $token : QuoteService::token());
+        $normalised = QuoteService::normaliseEndpoint(App::input('quote_endpoint'), $effectiveToken);
         if (!is_array($normalised) || $normalised['ok'] !== true) {
             throw new UserError(is_array($normalised) && is_string($normalised['error'] ?? null)
                 ? $normalised['error']
@@ -877,7 +905,11 @@ final class Handlers
             Settings::put('quote_endpoint', $endpoint);
             Settings::put('base_currency', $base);
             Settings::put('quote_source', $source);
-            QuoteService::setToken($token);
+            if ($token !== '') {
+                QuoteService::setToken($token);
+            } elseif ($clearToken) {
+                QuoteService::setToken('');
+            }
             Settings::put('quote_refresh_budget_seconds', $refreshBudget);
             if ($endpointChanged || $clearCooldown) {
                 QuoteService::clearCooldown();
@@ -1086,7 +1118,8 @@ final class Handlers
         }
 
         // Nothing in scope is not an error: the header-only file says so in the name and opens empty.
-        $sql = 'SELECT t.traded_on, p.name AS portfolio, i.symbol, i.name AS instrument, i.market, i.currency,
+        $sql = 'SELECT t.traded_on, p.name AS portfolio, i.symbol, i.name AS instrument, i.market,
+                       COALESCE(NULLIF(t.currency, \'\'), i.currency) AS currency,
                        t.side, t.quantity, t.price, t.fee, (t.quantity * t.price) AS gross, t.note
                 FROM transactions t
                 JOIN instruments i ON i.id = t.instrument_id
@@ -1151,41 +1184,18 @@ final class Handlers
 
     // -------------------------------------------------------------- helpers
 
-    /** @return array{ok:bool, price:?float, as_of:?string, error:?string} */
-    private static function applyQuote(int $instrumentId): array
-    {
-        $inst = Database::one('SELECT * FROM instruments WHERE id = ?', [$instrumentId]);
-        if ($inst === null) {
-            return ['ok' => false, 'price' => null, 'as_of' => null, 'error' => '投資物不存在'];
-        }
-
-        $quote = QuoteService::get((string) $inst['yahoo_symbol']);
-        if (!$quote['ok'] || $quote['price'] === null) {
-            return ['ok' => false, 'price' => null, 'as_of' => null, 'error' => $quote['error'] ?? '查無資料'];
-        }
-
-        $quote['currency'] = self::safeCurrency($quote['currency'] ?? null, (string) $inst['currency']);
-        try {
-            $currency = QuoteService::writeQuote($instrumentId, $quote);
-        } catch (UserError $e) {
-            return ['ok' => false, 'price' => null, 'as_of' => null, 'error' => $e->getMessage()];
-        }
-        QuoteService::refreshFx([$currency]);
-
-        return ['ok' => true, 'price' => $quote['price'], 'as_of' => $quote['as_of'], 'error' => null];
-    }
-
     /** @return array{id:int, symbol:string, currency:string, fresh:bool} */
     private static function resolveInstrument(): array
     {
         $id = App::intInput('instrument_id');
         if ($id > 0) {
-            $row = Database::one('SELECT id, symbol FROM instruments WHERE id = ?', [$id]);
+            $row = Database::one('SELECT id, symbol, currency FROM instruments WHERE id = ?', [$id]);
             if ($row === null) {
                 throw new UserError('選取的投資物不存在。');
             }
 
-            return ['id' => (int) $row['id'], 'symbol' => (string) $row['symbol'], 'currency' => '', 'fresh' => false];
+            return ['id' => (int) $row['id'], 'symbol' => (string) $row['symbol'],
+                'currency' => (string) $row['currency'], 'fresh' => false];
         }
 
         $symbol = self::textInput('new_symbol', 'symbol');
@@ -1199,10 +1209,10 @@ final class Handlers
         }
 
         $yahoo = Markets::toYahoo($symbol, $market);
-        $existing = Database::one('SELECT id, symbol FROM instruments WHERE yahoo_symbol = ?', [$yahoo]);
+        $existing = Database::one('SELECT id, symbol, currency FROM instruments WHERE yahoo_symbol = ?', [$yahoo]);
         if ($existing !== null) {
             return ['id' => (int) $existing['id'], 'symbol' => (string) $existing['symbol'],
-                'currency' => '', 'fresh' => false];
+                'currency' => (string) $existing['currency'], 'fresh' => false];
         }
 
         $currency = self::currencyInput('new_currency', Markets::currencyFor($market));
@@ -1247,14 +1257,6 @@ final class Handlers
         }
 
         return $code;
-    }
-
-    /** 網路回傳的幣別不做猜測或補字，只接受嚴格的大寫格式，否則沿用投資物幣別。 */
-    private static function safeCurrency(mixed $fromQuote, string $fallback): string
-    {
-        return is_string($fromQuote) && preg_match(self::CURRENCY_PATTERN, $fromQuote) === 1
-            ? $fromQuote
-            : $fallback;
     }
 
     private static function assetClassInput(string $field, string $default): string

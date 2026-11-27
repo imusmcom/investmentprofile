@@ -31,6 +31,9 @@ final class Strategy
     /** 低於這個根數，回歸線只是連兩點的直線，沒有統計意義。 */
     private const MIN_BARS = 250;
 
+    /** 回退到較早歷史時，只補最早的一批日線；避免稀疏標的把整張 prices 表載入記憶體。 */
+    private const MAX_EARLIER_HISTORY_BARS = 5000;
+
     /** 通道（布林）的經典參數：20 期均線加減 2 倍標準差。這裡的「期」是週。 */
     private const BB_WEEKS = 20;
     private const BB_MULT = 2.0;
@@ -103,6 +106,12 @@ final class Strategy
             }
         }
 
+        // A sparse instrument can have fewer than MIN_BARS inside 42 months even though its database
+        // history is long. Fetch the earliest stored bars for those instruments only, in one extra batch.
+        foreach (self::widenHistory($cutoffs, $history) as $iid => $earlier) {
+            $history[$iid] = array_merge($history[$iid] ?? [], $earlier);
+        }
+
         foreach ($instruments as $inst) {
             $iid = (int) $inst['id'];
             $bars = self::barsFromHistory(
@@ -150,8 +159,61 @@ final class Strategy
                 [$instrumentId, self::monthsBefore($anchor, self::WINDOW_MONTHS)]
             );
 
+            if ($anchor !== null && count($rows) < self::MIN_BARS) {
+                $earlier = self::widenHistory(
+                    [$instrumentId => self::monthsBefore($anchor, self::WINDOW_MONTHS)],
+                    [$instrumentId => $rows]
+                );
+                $rows = array_merge($rows, $earlier[$instrumentId] ?? []);
+            }
+
             return self::barsFromHistory($rows, $manual, $manualAt, $newest);
         });
+    }
+
+    /**
+     * Supply earlier bars only when the normal 42-month query cannot reach MIN_BARS. The earliest
+     * MAX_EARLIER_HISTORY_BARS extend the regression window while keeping memory bounded.
+     *
+     * @param array<int,string> $cutoffs instrument id => 42-month cutoff
+     * @param array<int,array<int,array<string,mixed>>> $recent recent rows already loaded per instrument
+     * @return array<int,array<int,array<string,mixed>>>
+     */
+    private static function widenHistory(array $cutoffs, array $recent): array
+    {
+        $params = [];
+        $values = [];
+        foreach ($cutoffs as $iid => $cutoff) {
+            if (count($recent[$iid] ?? []) >= self::MIN_BARS) {
+                continue;
+            }
+            $values[] = '(?, ?)';
+            $params[] = $iid;
+            $params[] = $cutoff;
+        }
+        if ($values === []) {
+            return [];
+        }
+
+        $holders = implode(',', $values);
+        $rows = Database::all(
+            "WITH needed(instrument_id, cutoff) AS (VALUES $holders),
+             earlier AS (
+                 SELECT p.instrument_id, p.as_of, p.close, p.adj_close,
+                        ROW_NUMBER() OVER (PARTITION BY p.instrument_id ORDER BY p.as_of) AS rn
+                 FROM prices p JOIN needed n ON n.instrument_id = p.instrument_id
+                 WHERE p.as_of < n.cutoff
+             )
+             SELECT instrument_id, as_of, close, adj_close FROM earlier
+             WHERE rn <= " . self::MAX_EARLIER_HISTORY_BARS . ' ORDER BY instrument_id, as_of',
+            $params
+        );
+        $out = [];
+        foreach ($rows as $row) {
+            $out[(int) $row['instrument_id']][] = $row;
+        }
+
+        return $out;
     }
 
     /** @param array<int, array<string, mixed>> $rows */
@@ -394,7 +456,7 @@ final class Strategy
             $row['warn'][] = '已衝上＋2SD：來源的作法是等它拉回測試通道，而不是在最高點加碼。';
         }
         if ($widened) {
-            $row['warn'][] = sprintf('42 個月窗口不足 %d 根，改用完整歷史 %s 個月、%d 根；回歸線涵蓋較長期間，對近期價格變化較不敏感。',
+            $row['warn'][] = sprintf('42 個月窗口不足 %d 根，已補入較早歷史；合計跨度 %s 個月、%d 根，回歸線涵蓋較長期間，對近期價格變化較不敏感。',
                 self::MIN_BARS, fmt_num((float) $row['months'], 1), $n);
         }
         if ($row['months'] !== null && (float) $row['months'] < self::WINDOW_MONTHS - 2) {

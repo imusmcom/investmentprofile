@@ -8,10 +8,11 @@ use DateTimeImmutable;
 /**
  * Time-weighted performance for the 回報 page, built from the daily closes already in `prices`.
  *
- * Three rules make the numbers defensible:
+ * These rules make the numbers defensible:
  *  - a trade only moves value between the holdings sleeve and cash, so the holdings column chain-links
  *    at every trade date instead of letting a purchase look like a gain;
- *  - 存入／提取 are the only external flows, so the 持股＋現金 column chain-links at those dates;
+ *  - 存入／提取 are principal changes and count directly in the cash and 持股＋現金 returns;
+ *  - the cash sleeve treats trade principal as a transfer and keeps fees in its return;
  *  - one exchange rate per currency is used across the whole series, because `fx_rates` keeps a single
  *    row per currency and has no history. Multi-currency returns are therefore constant-rate returns.
  */
@@ -56,6 +57,8 @@ final class Performance
             'base'          => $base,
             'start'         => null,
             'end'           => null,
+            'price_end'     => null,
+            'stale'         => false,
             'points'        => 0,
             'trades'        => 0,
             'end_holdings'  => null,
@@ -85,35 +88,42 @@ final class Performance
              ORDER BY i.market, i.symbol",
             $ids
         );
-        if ($instruments === []) {
-            return ['periods' => [], 'years' => [], 'meta' => array_merge($meta, ['note' => '這個範圍還沒有交易紀錄，沒有可回溯的持股。'])];
+        if ($instruments === [] && Database::scalar(
+            'SELECT COUNT(*) FROM cash_movements WHERE portfolio_id IN (' . $holders . ')',
+            $ids,
+            0
+        ) == 0) {
+            return ['periods' => [], 'years' => [], 'meta' => array_merge($meta, ['note' => '這個範圍還沒有交易或現金紀錄。'])];
         }
 
         $currencies = [$base => true];
-        $curById = [];
         $symbolById = [];
         $barsByDate = [];
         $cutoff = Calendar::subtractMonths(date('Y-m-d'), self::READ_MONTHS);
         $instrumentIds = array_map(static fn (array $inst): int => (int) $inst['id'], $instruments);
-        $priceHolders = implode(',', array_fill(0, count($instrumentIds), '?'));
         $newestByInstrument = [];
-        foreach (Database::all(
-            "SELECT instrument_id, as_of, close FROM prices
-             WHERE instrument_id IN ($priceHolders) AND as_of >= ? ORDER BY instrument_id, as_of",
-            [...$instrumentIds, $cutoff]
-        ) as $row) {
-            $iid = (int) $row['instrument_id'];
-            $rawPrice = self::positivePrice($row['close']);
-            $barsByDate[(string) $row['as_of']][$iid] = [
-                'close' => $rawPrice,
-            ];
-            $newestByInstrument[$iid] = (string) $row['as_of'];
+        if ($instrumentIds !== []) {
+            $priceHolders = implode(',', array_fill(0, count($instrumentIds), '?'));
+            foreach (Database::all(
+                "SELECT instrument_id, as_of, close, currency FROM prices
+                 WHERE instrument_id IN ($priceHolders) AND as_of >= ? ORDER BY instrument_id, as_of",
+                [...$instrumentIds, $cutoff]
+            ) as $row) {
+                $iid = (int) $row['instrument_id'];
+                $rawPrice = self::positivePrice($row['close']);
+                $barCurrency = strtoupper(trim((string) $row['currency']));
+                $barsByDate[(string) $row['as_of']][$iid] = [
+                    'close' => $rawPrice,
+                    'currency' => $barCurrency,
+                ];
+                $currencies[$barCurrency] = true;
+                $newestByInstrument[$iid] = (string) $row['as_of'];
+            }
         }
 
         foreach ($instruments as $inst) {
             $iid = (int) $inst['id'];
             $cur = strtoupper(trim((string) $inst['currency']));
-            $curById[$iid] = $cur;
             $symbolById[$iid] = (string) $inst['symbol'];
             $currencies[$cur] = true;
 
@@ -130,16 +140,21 @@ final class Performance
                 && strcmp($effective['as_of'], $cutoff) >= 0) {
                 $barsByDate[$effective['as_of']][$iid] = [
                     'close' => $effective['price'],
+                    'currency' => $cur,
                 ];
             }
         }
 
         $tradeEvents = [];
         foreach (Database::all(
-            "SELECT portfolio_id, instrument_id, side, quantity, price, fee, traded_on
-             FROM transactions WHERE portfolio_id IN ($holders) ORDER BY traded_on, id",
+            "SELECT portfolio_id, instrument_id, side, quantity, price, fee, traded_on,
+                    COALESCE(NULLIF(t.currency, ''), i.currency) AS currency
+             FROM transactions t
+             JOIN instruments i ON i.id = t.instrument_id
+             WHERE portfolio_id IN ($holders) ORDER BY traded_on, t.id",
             $ids
         ) as $t) {
+            $currencies[strtoupper(trim((string) $t['currency']))] = true;
             $tradeEvents[(string) $t['traded_on']][] = $t;
         }
 
@@ -199,42 +214,41 @@ final class Performance
         }
 
         $points = [];
+        $axis = [];
         $qty = $cash = $lastRaw = [];
-        $pendingTrade = $pendingExt = 0.0;
-        // Replay every historical event to preserve opening quantities/cash, but only actual price dates
-        // are points on the return axis; event-only principal waits for the next priced point.
+        $lastPriceDateByInstrument = [];
+        $endpointPriceDate = null;
+        $pendingTrade = 0.0;
+        // Actual price dates remain the preferred baseline. Once pricing has begun, later event-only dates
+        // carry the last known prices forward so deposits/trades are not silently omitted from the endpoint.
         $dates = array_keys($barsByDate + $tradeEvents + $cashEvents);
-        $axis = array_keys($barsByDate);
         sort($dates);
-        sort($axis);
-        $hasPrice = array_fill_keys($axis, true);
 
         $meta['trades'] = array_sum(array_map('count', $tradeEvents));
 
         foreach ($dates as $date) {
             $netTrade = 0.0;
-            $netExt = 0.0;
 
             foreach ($cashEvents[$date] ?? [] as $c) {
                 $cur = strtoupper(trim((string) $c['currency']));
                 $delta = (float) $c['amount'] * ((string) $c['direction'] === 'IN' ? 1.0 : -1.0);
                 $cash[$cur] = ($cash[$cur] ?? 0.0) + $delta;
-                $netExt += $delta * $rates[$cur];
-                if (!is_finite($delta) || !is_finite($cash[$cur]) || !is_finite($netExt)) {
+                if (!is_finite($delta) || !is_finite($cash[$cur])) {
                     return $numericFailure('現金流量累計超出可計算範圍，報酬略過不算。');
                 }
             }
 
             foreach ($barsByDate[$date] ?? [] as $iid => $bar) {
                 if ($bar['close'] !== null) {
-                    $lastRaw[(int) $iid] = $bar['close'];
+                    $lastRaw[(int) $iid] = $bar;
+                    $lastPriceDateByInstrument[(int) $iid] = $date;
                 }
             }
 
             foreach ($tradeEvents[$date] ?? [] as $t) {
                 $pid = (int) $t['portfolio_id'];
                 $iid = (int) $t['instrument_id'];
-                $cur = $curById[$iid] ?? '';
+                $cur = strtoupper(trim((string) $t['currency']));
                 $q = (float) $t['quantity'];
                 $px = (float) $t['price'];
                 $fee = (float) $t['fee'];
@@ -259,15 +273,24 @@ final class Performance
 
             $h = 0.0;
             $isPartial = false;
+            $hasHoldings = false;
+            $endpointPriceDate = null;
             foreach ($qty as $positions) {
                 foreach ($positions as $iid => $q) {
                     if ($q <= self::EPSILON) {
                         continue;
                     }
+                    $hasHoldings = true;
                     if (!isset($lastRaw[$iid])) {
                         $isPartial = true;
                     } else {
-                        $h += $q * $lastRaw[$iid] * $rates[$curById[$iid] ?? ''];
+                        $bar = $lastRaw[$iid];
+                        $h += $q * $bar['close'] * $rates[$bar['currency']];
+                        $priceDate = $lastPriceDateByInstrument[$iid] ?? null;
+                        if ($priceDate !== null
+                            && ($endpointPriceDate === null || strcmp($priceDate, $endpointPriceDate) < 0)) {
+                            $endpointPriceDate = $priceDate;
+                        }
                     }
                 }
             }
@@ -283,42 +306,56 @@ final class Performance
                 return $numericFailure('現金餘額累計超出可計算範圍，報酬略過不算。');
             }
 
-            if (!isset($hasPrice[$date])) {
-                // The event-only post-state is the baseline. Same-day flow offsets the baseline value;
-                // the principal stays pending so the next price date measures growth from that baseline.
-                $pendingTrade = ($pendingTrade ?? 0.0) + $netTrade;
-                $pendingExt = ($pendingExt ?? 0.0) + $netExt;
-                if (!is_finite($pendingTrade) || !is_finite($pendingExt)) {
+            $pricedDate = isset($barsByDate[$date]);
+            $cashOnly = $barsByDate === [] && $instruments === [] && $cashEvents !== [];
+            if (!$pricedDate && $points === [] && !$cashOnly) {
+                // Before the first usable price, an event-only state is the baseline, not a return point.
+                $pendingTrade += $netTrade;
+                if (!is_finite($pendingTrade)) {
                     return $numericFailure('期間本金累計超出可計算範圍，報酬略過不算。');
                 }
                 continue;
             }
 
             $pendingTrade += $netTrade;
-            $pendingExt += $netExt;
-            if (!is_finite($pendingTrade) || !is_finite($pendingExt)) {
+            if (!is_finite($pendingTrade)) {
                 return $numericFailure('期間本金累計超出可計算範圍，報酬略過不算。');
             }
+            $total = $h + $c;
+            if (!is_finite($total)) {
+                return $numericFailure('持股與現金合計超出可計算範圍，報酬略過不算。');
+            }
 
+            $axis[] = $date;
             $points[] = [
-                'date'     => $date,
-                'hold'     => $h,
-                'cash'     => $c,
-                'total'    => $h + $c,
+                'date'      => $date,
+                'hold'      => $h,
+                'cash'      => $c,
+                'total'     => $total,
+                // Buying moves principal out of cash; selling moves it back in. Deposits and withdrawals
+                // deliberately stay in the cash return, so only trade principal is removed here.
+                'cash_flow' => -(float) $pendingTrade,
                 // The event-only post-state is already the baseline value; its principal offsets it.
                 'trade_net' => (float) $pendingTrade,
-                'ext_net'  => (float) $pendingExt,
-                'partial'  => $isPartial,
+                'partial'   => $isPartial,
+                // Only prices carried by holdings matter here. A fresh quote for a sold instrument must
+                // not hide another holding's stale price, and cash-only endpoints have no price to age.
+                'stale'     => $hasHoldings && $endpointPriceDate !== null
+                    && strcmp($date, $endpointPriceDate) > 0,
             ];
             $pendingTrade = 0.0;
-            $pendingExt = 0.0;
         }
 
         if ($points === []) {
             return [
                 'periods' => [],
                 'years'   => [],
-                'meta'    => array_merge($meta, ['missing_price' => $missingPrice, 'note' => '還沒有任何歷史日線，按「更新報價與匯率」抓取。']),
+                'meta'    => array_merge($meta, [
+                    'missing_price' => $missingPrice,
+                    'note' => $instruments === [] && $cashEvents === []
+                        ? '這個範圍還沒有交易或現金紀錄。'
+                        : '還沒有任何歷史日線，按「更新報價與匯率」抓取。',
+                ]),
             ];
         }
 
@@ -326,18 +363,19 @@ final class Performance
         $hold = array_column($points, 'hold');
         $cashV = array_column($points, 'cash');
         $total = array_column($points, 'total');
+        $cashFlow = array_column($points, 'cash_flow');
         $tradeNet = array_column($points, 'trade_net');
-        $extNet = array_column($points, 'ext_net');
         $partial = array_column($points, 'partial');
+        $stale = array_column($points, 'stale');
 
         $series = [
             'axis' => $axis, 'hold' => $hold,
             'cash' => $cashV, 'total' => $total,
-            'trade_net' => $tradeNet, 'ext_net' => $extNet, 'partial' => $partial,
+            'cash_flow' => $cashFlow, 'trade_net' => $tradeNet,
+            'no_flow' => array_fill(0, count($points), 0.0), 'partial' => $partial, 'stale' => $stale,
         ];
         $to = count($points) - 1;
         $anchor = $axis[$to];
-        $lastPrice = $axis[$to];
 
         $periods = [];
         foreach (self::PERIODS as $period) {
@@ -347,10 +385,16 @@ final class Performance
             if ($kind === 'prev') {
                 $from = $to > 0 ? $to - 1 : null;
             } else {
-                $target = $kind === 'ytd'
-                    ? substr($lastPrice, 0, 4) . '-01-01'
-                    : Calendar::subtractMonths($lastPrice, (int) $period['n']);
-                $from = self::indexAt($axis, $target, $lastPrice);
+                if ($kind === 'days') {
+                    $target = (new DateTimeImmutable($anchor))
+                        ->modify('-' . (int) $period['n'] . ' days')
+                        ->format('Y-m-d');
+                } else {
+                    $target = $kind === 'ytd'
+                        ? sprintf('%04d-12-31', (int) substr($anchor, 0, 4) - 1)
+                        : Calendar::subtractMonths($anchor, (int) $period['n']);
+                }
+                $from = self::indexAt($axis, $target, $anchor);
                 if ($from === null && strcmp((string) $axis[0], $target) <= 0) {
                     $from = 0;
                     $note = "起點沿用資料最早一筆（{$axis[0]}）";
@@ -389,6 +433,8 @@ final class Performance
                 'base'          => $base,
                 'start'         => $axis[0],
                 'end'           => $anchor,
+                'price_end'     => $endpointPriceDate,
+                'stale'         => $stale[$to],
                 'points'        => count($axis),
                 'trades'        => $meta['trades'],
                 'end_holdings'  => $hold[$to],
@@ -413,10 +459,12 @@ final class Performance
             'start'        => null,
             'end'          => (string) $s['axis'][$to],
             'holdings_pct' => null,
+            'cash_pct'     => null,
             'total_pct'    => null,
             'holdings_end' => (float) $s['hold'][$to],
             'cash_end'     => (float) $s['cash'][$to],
             'complete'     => !$s['partial'][$to],
+            'stale_end'    => !empty($s['stale'][$to]),
             'note'         => '',
         ];
 
@@ -429,34 +477,53 @@ final class Performance
         }
 
         $row['start'] = (string) $s['axis'][$from];
+        $endpointsComplete = $s['partial'][$from] !== true && $s['partial'][$to] !== true;
 
-        // 中途缺一天就會讓前後兩段根本不是同一串可比值；端點檢查抓不到這種洞，逐日看才算數。
-        for ($i = $from + 1; $i < $to; $i++) {
+        // 現金餘額不需要持股報價；合計現在只看期初與期末總值，所以中間缺價不影響這兩欄。
+        $row['cash_pct'] = self::chain($s['cash'], $s['cash_flow'], $from, $to, true);
+        if ($endpointsComplete) {
+            $row['total_pct'] = self::chain($s['total'], $s['no_flow'], $from, $to, true);
+        }
+
+        // 持股仍是時間加權報酬，中途缺一天就會讓前後兩段不是同一串可比值，必須逐日檢查。
+        $holdingsComplete = $endpointsComplete;
+        for ($i = $from + 1; $holdingsComplete && $i < $to; $i++) {
             if ($s['partial'][$i] === true) {
-                $row['note'] = '期間內有交易日查不到歷史日線，報酬略過不算';
+                $holdingsComplete = false;
+            }
+        }
+        if ($holdingsComplete) {
+            $row['holdings_pct'] = self::chain($s['hold'], $s['trade_net'], $from, $to);
+        }
 
-                return $row;
+        if ($row['holdings_pct'] === null && $row['total_pct'] === null && $row['cash_pct'] === null) {
+            $row['note'] = $endpointsComplete
+                ? '期間內有區段無法計價，或起點還沒有持股，報酬略過不算'
+                : '期間起點或期末有持股查不到歷史日線';
+        } else {
+            $issues = [];
+            if ($row['holdings_pct'] === null) {
+                $issues[] = '持股報酬有區段無法計價，報酬略過不算';
+            }
+            if ($row['total_pct'] === null) {
+                $issues[] = '合計報酬無法計價（基值為零／負數，或期初／期末缺價）';
+            }
+            if ($row['cash_pct'] === null) {
+                $issues[] = '現金報酬有區段無法計價，報酬略過不算';
+            }
+            if ($issues !== []) {
+                $row['note'] = implode('；', $issues);
+                if ($note !== '') {
+                    $row['note'] .= '；' . $note;
+                }
+            } elseif ($note !== '') {
+                $row['note'] = $note;
             }
         }
 
-        if ($s['partial'][$from] === true || $s['partial'][$to] === true) {
-            $row['note'] = '期間起點或期末有持股查不到歷史日線';
-
-            return $row;
-        }
-
-        // 餘額、市值與時間加權報酬全部使用未調整收盤，和成交價保持同一口徑。
-        $row['holdings_pct'] = self::chain($s['hold'], $s['trade_net'], $from, $to);
-        $row['total_pct'] = self::chain($s['total'], $s['ext_net'], $from, $to);
-
-        if ($row['holdings_pct'] === null && $row['total_pct'] === null) {
-            $row['note'] = '期間內有區段無法計價，或起點還沒有持股，報酬略過不算';
-        } elseif ($row['holdings_pct'] === null) {
-            $row['note'] = '持股報酬有區段無法計價，報酬略過不算';
-        } elseif ($row['total_pct'] === null) {
-            $row['note'] = '總報酬有區段無法計價，報酬略過不算';
-        } elseif ($note !== '') {
-            $row['note'] = $note;
+        if ($row['stale_end']) {
+            $staleNote = '期末沒有當日報價，持股沿用最後已知價';
+            $row['note'] = $row['note'] === '' ? $staleNote : $row['note'] . '；' . $staleNote;
         }
 
         return $row;
@@ -464,10 +531,13 @@ final class Performance
 
     /**
      * Chain-link the sub-period returns that start where a flow landed, so flows never read as gains.
+     * A zero balance with no fee is a neutral 0% segment; a negative balance has no valid base.
      *
+     * @param array<int, float|int|string|null> $values
+     * @param array<int, float|int|string|null> $flows
      * @return ?float percent, or null when nothing in the window had a value to grow
      */
-    private static function chain(array $values, array $flows, int $from, int $to): ?float
+    private static function chain(array $values, array $flows, int $from, int $to, bool $flatZero = false): ?float
     {
         $acc = 1.0;
         $measured = false;
@@ -485,14 +555,24 @@ final class Performance
             }
 
             $base = (float) $values[$start];
-            if (!is_finite($base) || !is_finite((float) $values[$i])) {
+            $end = (float) $values[$i];
+            if (!is_finite($base) || !is_finite($end)) {
                 return null;
             }
+            if ($flatZero && ($base < -self::EPSILON || $end < -self::EPSILON)) {
+                return null;
+            }
+            $growth = $end - $base - $net;
             if ($base > self::EPSILON) {
-                $acc *= 1.0 + ((float) $values[$i] - $base - $net) / $base;
+                $acc *= 1.0 + $growth / $base;
                 if (!is_finite($acc)) {
                     return null;
                 }
+                $measured = true;
+            } elseif ($flatZero && $base >= -self::EPSILON && $end >= -self::EPSILON
+                && is_finite($growth) && abs($growth) <= self::EPSILON) {
+                // Fully invested or newly sold cash is still a valid, unchanged cash sleeve when all
+                // of its balance change is explained by principal. Do not label an ordinary 0% as missing.
                 $measured = true;
             } else {
                 // 只要有一段沒有可計算的基值，整段相乘就會漏掉那段績效，不能假裝剩下來的就是全期間。
@@ -541,7 +621,7 @@ final class Performance
                 }
             }
         }
-        if (strcmp((string) $axis[$lo], $date) > 0) {
+        if (strcmp((string) $axis[0], $date) > 0) {
             return null;
         }
 

@@ -137,6 +137,12 @@ fi
 exit 0
 SH
 chmod +x "$NGINX_DIR/nginx"
+# Deployment tests must never reload a real host service, even if this machine happens to run PHP-FPM.
+cat > "$NGINX_DIR/systemctl" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod +x "$NGINX_DIR/systemctl"
 
 bt_conf() { # bt_conf <path> <有extension include:1|0> <域名>
     local ext=''
@@ -158,11 +164,14 @@ CONF
 }
 run_case() { # run_case <case> <conf> <extra...>；參數裡出現 BROKEN-SOCKET 就讓假 nginx 驗證不過
     local name="$1" conf="$2"; shift 2
-    local bad='' case_rc=0
+    local bad='' fpm_fail='' case_rc=0
     case "$*" in *BROKEN-SOCKET*) bad='BROKEN-SOCKET' ;; esac
+    case "$*" in *BROKEN-FPM*) fpm_fail=1 ;; esac
     : > "$WORK/log/$name.log"
+    : > "$WORK/log/$name.fpm.log"
     if PATH="$NGINX_DIR:$PATH" NGINX_LOG="$WORK/log/$name.log" \
         NGINX_BAD="$bad" NGINX_CONF="$conf" NGINX_EXT_DIR="$EXT_DIR" \
+        FPM_LOG="$WORK/log/$name.fpm.log" FPM_FAIL="$fpm_fail" \
         bash "$ROOT/deploy-bt.sh" --site-dir="$SITE" --php-bin="$PHP" \
             --snapshot="$WORK/import.sqlite" --conf="$conf" --skip-net "$@" \
             > "$WORK/log/$name.out" 2>&1; then
@@ -220,7 +229,7 @@ t "主設定檔一個字節都沒變" "$ORIG_EXT" "$(md5 "$EXT_CONF")"
 t "片段落在 extension 目錄" present "$(exists "$EXT_TARGET")"
 t "那邊只有一段" 1 "$(cnt "$EXT_TARGET" "$TAG")"
 t "補了 root 指向 public" 1 "$(cnt "$EXT_TARGET" "root $SITE/public;")"
-t "socket 名字對（83 不帶點）" 1 "$(cnt "$EXT_TARGET" 'fastcgi_pass  unix:/tmp/php-cgi-83.sock;')"
+t "專用 socket 名字對（83 不帶點）" 1 "$(cnt "$EXT_TARGET" 'fastcgi_pass  unix:/tmp/portfolio-php-83.sock;')"
 t "沒有重複宣告寶塔 enable-php 那條 location" 0 "$(cnt "$EXT_TARGET" 'location ~ [^/]\.php(/|$)')"
 t "用的是 (/.\*)? 那種不同字面" true "$(has "$EXT_TARGET" 'location ~ [^/]\.php(/.*)?$')"
 t "server scope 一律拒絕 framing" 1 "$(cnt "$EXT_TARGET" 'add_header X-Frame-Options DENY always;')"
@@ -263,7 +272,87 @@ t "設定裡還是只有一段" 1 "$(cnt "$INLINE_CONF" "$TAG")"
 t "備份還是只有一份" 1 "$(ls -1 "$INLINE_CONF".bak-* 2>/dev/null | wc -l)"
 t "說明不重複插入" 1 "$(loghas auto_inline2 '已經有上次插進去的那段')"
 
-n "4c. 註解掉的 extension include 不算有效配置"
+n "4c. inline 片段設定改變時替換 owned block，而不是看到 tag 就跳過"
+run_case auto_inline_update "$INLINE_CONF" --apply --write-nginx --socket=unix:/tmp/portfolio-updated.sock
+t "更新後仍只有一段" 1 "$(cnt "$INLINE_CONF" "$TAG")"
+t "socket 已更新" 1 "$(cnt "$INLINE_CONF" 'fastcgi_pass  unix:/tmp/portfolio-updated.sock;')"
+t "舊 socket 已移除" 0 "$(cnt "$INLINE_CONF" 'fastcgi_pass  unix:/tmp/portfolio-php-83.sock;')"
+t "片段有明確結束標記" 1 "$(cnt "$INLINE_CONF" '# END deploy-bt.sh managed fragment end')"
+t "更新前另留備份" 2 "$(ls -1 "$INLINE_CONF".bak-* 2>/dev/null | wc -l)"
+t "回報已比對更新" 1 "$(loghas auto_inline_update '已比對並更新')"
+t "nginx -t 通過" true "$(has "$WORK/log/auto_inline_update.out" 'nginx -t 通過')"
+UPDATED_INLINE_MD5="$(md5 "$INLINE_CONF")"
+run_case auto_inline_same "$INLINE_CONF" --apply --write-nginx --socket=unix:/tmp/portfolio-updated.sock
+t "相同設定重跑不重寫 inline" "$UPDATED_INLINE_MD5" "$(md5 "$INLINE_CONF")"
+t "相同設定重跑不重複備份" 2 "$(ls -1 "$INLINE_CONF".bak-* 2>/dev/null | wc -l)"
+t "相同設定仍不重複插入" 1 "$(cnt "$INLINE_CONF" "$TAG")"
+
+n "4d. inline 替換後 nginx -t 失敗會還原替換前版本"
+run_case broken_inline_update "$INLINE_CONF" --apply --write-nginx --socket=unix:/tmp/BROKEN-SOCKET.sock
+t "失敗後精確還原替換前版本" "$UPDATED_INLINE_MD5" "$(md5 "$INLINE_CONF")"
+t "失敗後沒有 reload" 0 "$(reloads broken_inline_update)"
+t "失敗後仍只有一段" 1 "$(cnt "$INLINE_CONF" "$TAG")"
+t "exit 1" true "$(rc broken_inline_update 1)"
+
+n "4d-2. 舊版無結束標記的 inline 片段升級時保留後加的使用者設定"
+LEGACY_CONF="$WORK/caseconf/legacy-inline.conf"
+sed '/^# END deploy-bt.sh managed fragment end$/d' "$INLINE_CONF" | sed '$d' > "$LEGACY_CONF"
+printf 'add_header X-User-Directive preserved always;\n}\n' >> "$LEGACY_CONF"
+cp "$LEGACY_CONF" "$WORK/caseconf/legacy-inline-original"
+LEGACY_ORIGINAL_MD5="$(md5 "$WORK/caseconf/legacy-inline-original")"
+run_case auto_legacy_inline "$LEGACY_CONF" --apply --write-nginx --socket=unix:/tmp/portfolio-legacy-updated.sock
+t "舊版片段升級後仍只有一段" 1 "$(cnt "$LEGACY_CONF" "$TAG")"
+t "舊版片段補上明確結束標記" 1 "$(cnt "$LEGACY_CONF" '# END deploy-bt.sh managed fragment end')"
+t "舊版片段的 socket 已更新" 1 "$(cnt "$LEGACY_CONF" 'fastcgi_pass  unix:/tmp/portfolio-legacy-updated.sock;')"
+t "後加的使用者 directive 没有被當成 owned block 刪除" 1 "$(cnt "$LEGACY_CONF" 'add_header X-User-Directive preserved always;')"
+t "舊版片段升級前留下備份" 1 "$(ls -1 "$LEGACY_CONF".bak-* 2>/dev/null | wc -l)"
+LEGACY_BAK="$(ls -1 "$LEGACY_CONF".bak-* 2>/dev/null | head -1)"
+t "舊版片段備份與升級前逐字節相同" "$LEGACY_ORIGINAL_MD5" "$(md5 "$LEGACY_BAK")"
+t "舊版片段升級通過 nginx 驗證" true "$(has "$WORK/log/auto_legacy_inline.out" 'nginx -t 通過')"
+LEGACY_MD5="$(md5 "$LEGACY_CONF")"
+run_case auto_legacy_same "$LEGACY_CONF" --apply --write-nginx --socket=unix:/tmp/portfolio-legacy-updated.sock
+t "升級後相同設定重跑不重寫" "$LEGACY_MD5" "$(md5 "$LEGACY_CONF")"
+t "升級後相同設定不新增備份" 1 "$(ls -1 "$LEGACY_CONF".bak-* 2>/dev/null | wc -l)"
+
+n "4d-2b. 舊版 location 結尾縮排時仍精確辨識邊界"
+INDENTED_LEGACY_CONF="$WORK/caseconf/indented-legacy-inline.conf"
+awk -v tag="# $TAG" '
+    $0 == tag { owned = 1 }
+    owned && !closed && $0 == "}" { $0 = "    }"; closed = 1 }
+    { print }
+' "$WORK/caseconf/legacy-inline-original" > "$INDENTED_LEGACY_CONF"
+INDENTED_ORIGINAL_MD5="$(md5 "$INDENTED_LEGACY_CONF")"
+run_case auto_indented_legacy "$INDENTED_LEGACY_CONF" --apply --write-nginx \
+    --socket=unix:/tmp/portfolio-indented-legacy.sock
+t "縮排舊版片段補上結束標記" 1 "$(cnt "$INDENTED_LEGACY_CONF" '# END deploy-bt.sh managed fragment end')"
+t "縮排舊版片段更新 socket" 1 "$(cnt "$INDENTED_LEGACY_CONF" 'fastcgi_pass  unix:/tmp/portfolio-indented-legacy.sock;')"
+t "縮排舊版片段保留後加 directive" 1 "$(cnt "$INDENTED_LEGACY_CONF" 'add_header X-User-Directive preserved always;')"
+t "縮排舊版片段只備份一次" 1 "$(ls -1 "$INDENTED_LEGACY_CONF".bak-* 2>/dev/null | wc -l)"
+INDENTED_LEGACY_BAK="$(ls -1 "$INDENTED_LEGACY_CONF".bak-* 2>/dev/null | head -1)"
+t "縮排舊版備份與原檔相同" "$INDENTED_ORIGINAL_MD5" "$(md5 "$INDENTED_LEGACY_BAK")"
+INDENTED_LEGACY_MD5="$(md5 "$INDENTED_LEGACY_CONF")"
+run_case auto_indented_legacy_same "$INDENTED_LEGACY_CONF" --apply --write-nginx \
+    --socket=unix:/tmp/portfolio-indented-legacy.sock
+t "縮排舊版升級後冪等" "$INDENTED_LEGACY_MD5" "$(md5 "$INDENTED_LEGACY_CONF")"
+t "縮排舊版升級後不新增備份" 1 "$(ls -1 "$INDENTED_LEGACY_CONF".bak-* 2>/dev/null | wc -l)"
+
+n "4d-3. 無法辨識舊版 inline 邊界時不覆蓋、不 reload"
+UNSAFE_CONF="$WORK/caseconf/unsafe-legacy.conf"
+cat > "$UNSAFE_CONF" <<CONF
+server
+{
+    root $SITE;
+# $TAG
+keep_user_setting yes;
+}
+CONF
+UNSAFE_MD5="$(md5 "$UNSAFE_CONF")"
+run_case unsafe_legacy_inline "$UNSAFE_CONF" --apply --write-nginx --socket=unix:/tmp/portfolio-legacy-updated.sock
+t "無法辨識邊界時原設定逐字節不變" "$UNSAFE_MD5" "$(md5 "$UNSAFE_CONF")"
+t "無法辨識邊界時不 reload nginx" 0 "$(reloads unsafe_legacy_inline)"
+t "無法辨識邊界時 exit 1" true "$(rc unsafe_legacy_inline 1)"
+
+n "4e. 註解掉的 extension include 不算有效配置"
 COMMENT_CONF="$WORK/caseconf/comment.conf"
 bt_conf "$COMMENT_CONF" 0 comment.example.com
 printf '\n# include %s/extension/bt.example.com/*.conf;\n' "$VHOST" >> "$COMMENT_CONF"
@@ -367,6 +456,320 @@ for invalid_domain in '' 'http://example.com' 'file:///tmp/example' '-https://ex
     fi
     t "拒絕不合格網址 [$invalid_domain] 並回 2" true "$([ "$DOMAIN_RC" = 2 ] && echo true || echo false)"
 done
+
+# ============================================================ 9c. 合成 PHP-FPM pool、自訂資料目錄與 OPcache
+n "9c. --php-etc-dir 只修改 /tmp 合成 pool；FPM／cron／create-admin 共用自訂資料庫"
+REAL_PHP="$PHP"
+POOL_ETC="$WORK/php/etc"
+CUSTOM_DATA="$WORK/custom data"
+mkdir -p "$POOL_ETC" "$WORK/php/bin" "$WORK/php/sbin" "$CUSTOM_DATA"
+cat > "$WORK/php/bin/php" <<SH
+#!/usr/bin/env bash
+exec "$REAL_PHP" "\$@"
+SH
+cat > "$WORK/php/sbin/php-fpm" <<'SH'
+#!/usr/bin/env bash
+echo "php-fpm $*" >> "${FPM_LOG:-/dev/null}"
+if [ "${FPM_FAIL:-0}" = "1" ] && [ "$1" = "-tt" ]; then
+    echo "synthetic php-fpm validation failure" >&2
+    exit 1
+fi
+exit 0
+SH
+chmod +x "$WORK/php/bin/php" "$WORK/php/sbin/php-fpm"
+cat > "$POOL_ETC/php-fpm.conf" <<'CONF'
+[global]
+pid = /tmp/synthetic-php-fpm.pid
+error_log = /tmp/synthetic-php-fpm.log
+CONF
+cat > "$POOL_ETC/portfolio-fpm.conf" <<'CONF'
+[portfolio]
+user = www
+group = www
+listen = /tmp/old-portfolio.sock
+env[PORTFOLIO_DATA_DIR] = /tmp/old-data
+php_admin_flag[opcache.enable] = on
+php_admin_value[opcache.memory_consumption] = 32
+php_admin_value[opcache.revalidate_freq] = 10
+CONF
+ORIG_MAIN="$(md5 "$POOL_ETC/php-fpm.conf")"
+ORIG_POOL="$(md5 "$POOL_ETC/portfolio-fpm.conf")"
+POOL_CONF="$POOL_ETC/portfolio-fpm.conf"
+PHP="$WORK/php/bin/php"
+run_case fpm_broken "$INLINE_CONF" --apply --write-nginx --php-etc-dir="$POOL_ETC" \
+    --data-dir="$CUSTOM_DATA" --socket=unix:/tmp/BROKEN-FPM.sock
+t "FPM 驗證失敗時 pool 精確還原" "$ORIG_POOL" "$(md5 "$POOL_CONF")"
+t "FPM 驗證失敗時主設定精確還原" "$ORIG_MAIN" "$(md5 "$POOL_ETC/php-fpm.conf")"
+t "FPM 驗證失敗不插入 include" 0 "$(cnt "$POOL_ETC/php-fpm.conf" 'portfolio-fpm.conf')"
+t "FPM 驗證失敗不 reload nginx" 0 "$(reloads fpm_broken)"
+t "FPM 驗證失敗 exit 1" true "$(rc fpm_broken 1)"
+
+run_case fpm_custom "$INLINE_CONF" --apply --write-nginx --php-etc-dir="$POOL_ETC" \
+    --data-dir="$CUSTOM_DATA" --socket=unix:/tmp/portfolio-custom.sock
+t "合成 FPM -tt 確實執行" 1 "$(cnt "$WORK/log/fpm_custom.fpm.log" 'php-fpm -tt')"
+t "pool 只有一個 [portfolio]" 1 "$(cnt "$POOL_CONF" '[portfolio]')"
+t "FPM env 指向自訂絕對資料目錄（含空白）" 1 "$(cnt "$POOL_CONF" "env[PORTFOLIO_DATA_DIR] = '$CUSTOM_DATA'")"
+t "session 路徑也在同一資料目錄" 1 "$(cnt "$POOL_CONF" "php_admin_value[session.save_path] = '$CUSTOM_DATA/sessions'")"
+t "session 目錄權限 700" 700 "$(stat -c '%a' "$CUSTOM_DATA/sessions")"
+t "Nginx 使用對應專用 socket" 1 "$(cnt "$INLINE_CONF" 'fastcgi_pass  unix:/tmp/portfolio-custom.sock;')"
+t "OPcache enable=on" 1 "$(cnt "$POOL_CONF" 'php_admin_flag[opcache.enable] = on')"
+t "OPcache memory=128" 1 "$(cnt "$POOL_CONF" 'php_admin_value[opcache.memory_consumption] = 128')"
+t "OPcache interned strings=16" 1 "$(cnt "$POOL_CONF" 'php_admin_value[opcache.interned_strings_buffer] = 16')"
+t "OPcache max files=10000" 1 "$(cnt "$POOL_CONF" 'php_admin_value[opcache.max_accelerated_files] = 10000')"
+t "OPcache revalidate=2" 1 "$(cnt "$POOL_CONF" 'php_admin_value[opcache.revalidate_freq] = 2')"
+t "主設定只 include 一次" 1 "$(grep -c 'include = .*portfolio-fpm.conf' "$POOL_ETC/php-fpm.conf")"
+printf -v cron_data '%q' "$CUSTOM_DATA"
+t "cron 命令帶同一 PORTFOLIO_DATA_DIR" true "$(has "$WORK/log/fpm_custom.out" "PORTFOLIO_DATA_DIR=$cron_data")"
+t "cron 命令也帶同一 --data-dir" true "$(has "$WORK/log/fpm_custom.out" "--data-dir=$cron_data")"
+t "create-admin 說明帶同一資料目錄" 1 "$(loghas fpm_custom "bin/create-admin.php --username=你的帳號 --data-dir=$cron_data")"
+t "自訂資料庫已建立" present "$(exists "$CUSTOM_DATA/portfolio.sqlite")"
+
+ADMIN_RC=0
+if printf '%s' 'synthetic-admin-password' | PORTFOLIO_DATA_DIR="$CUSTOM_DATA" "$REAL_PHP" \
+    "$ROOT/bin/create-admin.php" --username=synthetic-admin --password-from-stdin --force \
+    --data-dir="$CUSTOM_DATA" > "$WORK/log/create-admin-custom.out" 2>&1; then
+    ADMIN_RC=0
+else
+    ADMIN_RC=$?
+fi
+t "create-admin 用合成自訂資料庫成功" 0 "$ADMIN_RC"
+ADMIN_COUNT="$(PORTFOLIO_DATA_DIR="$CUSTOM_DATA" "$REAL_PHP" -r '
+    $p = new PDO("sqlite:" . $argv[1], null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    echo $p->query("SELECT count(*) FROM access WHERE username = \"synthetic-admin\"")->fetchColumn();
+' "$CUSTOM_DATA/portfolio.sqlite")"
+t "帳號只存在於 FPM 指向的資料庫" 1 "$ADMIN_COUNT"
+
+POOL_MD5="$(md5 "$POOL_CONF")"
+MAIN_MD5="$(md5 "$POOL_ETC/php-fpm.conf")"
+POOL_BAKS="$(ls -1 "$POOL_CONF".bak-* 2>/dev/null | wc -l)"
+MAIN_BAKS="$(ls -1 "$POOL_ETC/php-fpm.conf".bak-* 2>/dev/null | wc -l)"
+run_case fpm_same "$INLINE_CONF" --apply --write-nginx --php-etc-dir="$POOL_ETC" \
+    --data-dir="$CUSTOM_DATA" --socket=unix:/tmp/portfolio-custom.sock
+t "相同 pool 設定重跑不重寫" "$POOL_MD5" "$(md5 "$POOL_CONF")"
+t "相同主設定重跑不重複 include" "$MAIN_MD5" "$(md5 "$POOL_ETC/php-fpm.conf")"
+t "相同 pool 重跑不新增備份" "$POOL_BAKS" "$(ls -1 "$POOL_CONF".bak-* 2>/dev/null | wc -l)"
+t "相同主設定重跑不新增備份" "$MAIN_BAKS" "$(ls -1 "$POOL_ETC/php-fpm.conf".bak-* 2>/dev/null | wc -l)"
+t "pool 冪等輸出" 1 "$(loghas fpm_same '未重寫')"
+
+NEXT_DATA="$WORK/custom-next"
+mkdir -p "$NEXT_DATA"
+run_case fpm_next "$INLINE_CONF" --apply --write-nginx --php-etc-dir="$POOL_ETC" \
+    --data-dir="$NEXT_DATA" --socket=unix:/tmp/portfolio-next.sock
+t "資料目錄改變時更新 FPM env" 1 "$(cnt "$POOL_CONF" "env[PORTFOLIO_DATA_DIR] = '$NEXT_DATA'")"
+t "socket 改變時更新 pool listen" 1 "$(cnt "$POOL_CONF" 'listen = /tmp/portfolio-next.sock')"
+t "include 仍只有一份" 1 "$(grep -c 'include = .*portfolio-fpm.conf' "$POOL_ETC/php-fpm.conf")"
+t "pool 更新前留下新備份" "$((POOL_BAKS + 1))" "$(ls -1 "$POOL_CONF".bak-* 2>/dev/null | wc -l)"
+t "OPcache 更新後仍為 128M／2s" 2 "$(( $(cnt "$POOL_CONF" 'opcache.memory_consumption] = 128') + $(cnt "$POOL_CONF" 'opcache.revalidate_freq] = 2') ))"
+PHP="$REAL_PHP"
+
+# ============================================================ 9d. install.sh transaction rollback
+n "9d. install.sh 後續失敗時精確還原 FPM／Nginx；root --no-nginx 不管理 FPM"
+INSTALL_USER=www
+if [ "$EUID" != "0" ] || ! id "$INSTALL_USER" >/dev/null 2>&1; then
+    echo "  略過 install.sh 整合測試（需要 root 與 www 測試帳號）"
+else
+    INSTALL_ROOT="$WORK/install"
+    INSTALL_SOURCE="$INSTALL_ROOT/source"
+    INSTALL_PHP="$INSTALL_ROOT/php"
+    INSTALL_ETC="$INSTALL_PHP/etc"
+    INSTALL_PANEL="$INSTALL_ROOT/panel"
+    INSTALL_NGINX_CONF_DIR="$INSTALL_PANEL/vhost/nginx"
+    INSTALL_EXT_DIR="$INSTALL_ROOT/extension"
+    INSTALL_POOL="$INSTALL_ETC/portfolio-fpm.conf"
+    INSTALL_MAIN="$INSTALL_ETC/php-fpm.conf"
+    INSTALL_UNRELATED="$INSTALL_ETC/unrelated-pool.conf"
+    INSTALL_INI="$INSTALL_ETC/php.ini"
+    mkdir -p "$INSTALL_SOURCE/public" "$INSTALL_SOURCE/app" "$INSTALL_SOURCE/bin" \
+        "$INSTALL_PHP/bin" "$INSTALL_PHP/sbin" "$INSTALL_ETC" \
+        "$INSTALL_NGINX_CONF_DIR" "$INSTALL_EXT_DIR"
+    # runuser must be able to traverse the synthetic PHP wrapper and site parents.
+    chmod 755 "$WORK" "$INSTALL_ROOT" "$INSTALL_PHP" "$INSTALL_PHP/bin"
+    cp "$ROOT/deploy-bt.sh" "$INSTALL_SOURCE/deploy-bt.sh"
+    for f in public/index.php app/App.php app/bootstrap.php app/schema.sql bin/refresh-prices.php; do
+        printf '<?php\n' > "$INSTALL_SOURCE/$f"
+    done
+    cat > "$INSTALL_SOURCE/bin/create-admin.php" <<'PHP'
+<?php
+stream_get_contents(STDIN);
+file_put_contents(getenv('INSTALL_ADMIN_LOG'), json_encode([
+    'data_dir' => getenv('PORTFOLIO_DATA_DIR'),
+    'args' => array_slice($argv, 1),
+], JSON_UNESCAPED_SLASHES) . "\n", FILE_APPEND);
+PHP
+    cat > "$INSTALL_PHP/bin/php" <<SH
+#!/usr/bin/env bash
+exec "$REAL_PHP" "\$@"
+SH
+    cat > "$INSTALL_PHP/sbin/php-fpm" <<'SH'
+#!/usr/bin/env bash
+echo "php-fpm $*" >> "${FPM_LOG:-/dev/null}"
+exit 0
+SH
+    chmod +x "$INSTALL_PHP/bin/php" "$INSTALL_PHP/sbin/php-fpm"
+
+    reset_install_fpm() {
+        rm -f -- "$INSTALL_POOL"
+        cat > "$INSTALL_MAIN" <<CONF
+[global]
+include = $INSTALL_UNRELATED
+CONF
+        printf '[unrelated]\nlisten = /tmp/unrelated.sock\n' > "$INSTALL_UNRELATED"
+        printf 'upload_max_filesize = 2M\npost_max_size = 8M\ndate.timezone = UTC\n' > "$INSTALL_INI"
+        chmod 600 "$INSTALL_MAIN" "$INSTALL_INI"
+        chmod 644 "$INSTALL_UNRELATED"
+    }
+    write_install_conf() {
+        local conf="$1" site="$2" extension_include=""
+        if [[ "${3:-}" = "extension" ]]; then
+            extension_include="    include $INSTALL_EXT_DIR/*.conf;"
+        fi
+        cat > "$conf" <<CONF
+server {
+    listen 80;
+    server_name install.example;
+    root $site/public;
+    include enable-php-83.conf;
+$extension_include
+}
+CONF
+    }
+    run_install_case() {
+        local name="$1" source="$2" site="$3" data="$4" conf="$5" user="$6"
+        shift 6
+        : > "$WORK/log/$name.admin.log"
+        chmod 666 "$WORK/log/$name.admin.log"
+        : > "$WORK/log/$name.fpm.log"
+        : > "$WORK/log/$name.nginx.log"
+        if env PATH="$NGINX_DIR:$PATH" TMPDIR="$WORK" \
+            BT_PANEL_DIR="$INSTALL_PANEL" BT_NGINX_DIR="$INSTALL_NGINX_CONF_DIR" \
+            NGINX_BIN="$NGINX_DIR/nginx" NGINX_CONF="$conf" NGINX_EXT_DIR="$INSTALL_EXT_DIR" \
+            NGINX_LOG="$WORK/log/$name.nginx.log" FPM_LOG="$WORK/log/$name.fpm.log" \
+            INSTALL_ADMIN_LOG="$WORK/log/$name.admin.log" \
+            PORTFOLIO_ADMIN_PASSWORD=synthetic-install-password \
+            bash "$ROOT/install.sh" --source="$source" --site-dir="$site" --data-dir="$data" \
+                --php-bin="$INSTALL_PHP/bin/php" --user="$user" --username=synthetic \
+                --domain=install.example --conf="$conf" "$@" \
+                > "$WORK/log/$name.out" 2>&1; then
+            printf '0\n' > "$WORK/log/$name.rc"
+        else
+            printf '%s\n' "$?" > "$WORK/log/$name.rc"
+        fi
+    }
+
+    # Failure is deliberately after deploy-bt.sh has updated both FPM files and reloaded nginx.
+    printf '<?php this is not valid PHP\n' > "$INSTALL_SOURCE/public/zz-intentional-failure.php"
+    reset_install_fpm
+    cat > "$INSTALL_POOL" <<'CONF'
+[portfolio]
+user = www
+group = www
+listen = /tmp/install-old.sock
+env[PORTFOLIO_DATA_DIR] = /tmp/install-old-data
+CONF
+    chmod 640 "$INSTALL_POOL"
+    FAIL_SITE="$INSTALL_ROOT/fail-existing-site"
+    FAIL_DATA="$INSTALL_ROOT/fail-existing-data"
+    FAIL_CONF="$INSTALL_NGINX_CONF_DIR/fail-existing.conf"
+    write_install_conf "$FAIL_CONF" "$FAIL_SITE"
+    chmod 640 "$FAIL_CONF"
+    OLD_POOL_MD5="$(md5 "$INSTALL_POOL")"
+    OLD_MAIN_MD5="$(md5 "$INSTALL_MAIN")"
+    OLD_UNRELATED_MD5="$(md5 "$INSTALL_UNRELATED")"
+    OLD_INI_MD5="$(md5 "$INSTALL_INI")"
+    OLD_CONF_MD5="$(md5 "$FAIL_CONF")"
+    run_install_case install_fail_existing "$INSTALL_SOURCE" "$FAIL_SITE" "$FAIL_DATA" \
+        "$FAIL_CONF" "$INSTALL_USER"
+    t "部署後語法失敗確實 exit 非 0" false "$(rc install_fail_existing 0)"
+    t "失敗案例確實先更新過 portfolio pool" 1 "$(loghas install_fail_existing 'portfolio pool 已更新')"
+    t "失敗案例確實先修改過 inline Nginx 設定" 1 "$(loghas install_fail_existing '片段插進 server')"
+    t "失敗案例確實重新載入過 Nginx" 2 "$(cnt "$WORK/log/install_fail_existing.nginx.log" '-s reload')"
+    t "inline Nginx 站台設定逐字節還原" "$OLD_CONF_MD5" "$(md5 "$FAIL_CONF")"
+    t "inline Nginx 站台設定權限還原" 640 "$(stat -c '%a' "$FAIL_CONF")"
+    t "Nginx 還原後再次 reload" 2 "$(cnt "$WORK/log/install_fail_existing.nginx.log" '-s reload')"
+    t "既有 pool 逐字節還原" "$OLD_POOL_MD5" "$(md5 "$INSTALL_POOL")"
+    t "既有 pool 權限還原" 640 "$(stat -c '%a' "$INSTALL_POOL")"
+    t "既有 FPM 主設定逐字節還原" "$OLD_MAIN_MD5" "$(md5 "$INSTALL_MAIN")"
+    t "既有 FPM 主設定權限還原" 600 "$(stat -c '%a' "$INSTALL_MAIN")"
+    t "無關 pool 未被刪除或修改" "$OLD_UNRELATED_MD5" "$(md5 "$INSTALL_UNRELATED")"
+    t "回滾後沒有殘留 portfolio include" 0 "$(cnt "$INSTALL_MAIN" 'portfolio-fpm.conf')"
+    t "失敗安裝刪除新建程式目錄" missing "$(exists "$FAIL_SITE")"
+    t "失敗安裝刪除新建資料目錄" missing "$(exists "$FAIL_DATA")"
+    t "php.ini 逐字節還原" "$OLD_INI_MD5" "$(md5 "$INSTALL_INI")"
+    t "php.ini 權限還原" 600 "$(stat -c '%a' "$INSTALL_INI")"
+
+    reset_install_fpm
+    CREATED_SITE="$INSTALL_ROOT/fail-created-site"
+    CREATED_DATA="$INSTALL_ROOT/fail-created-data"
+    CREATED_CONF="$INSTALL_NGINX_CONF_DIR/fail-created.conf"
+    INSTALL_EXT_FILE="$INSTALL_EXT_DIR/portfolio-deploy.conf"
+    rm -f -- "$INSTALL_EXT_FILE"
+    write_install_conf "$CREATED_CONF" "$CREATED_SITE" extension
+    OLD_CREATED_CONF_MD5="$(md5 "$CREATED_CONF")"
+    OLD_MAIN_MD5="$(md5 "$INSTALL_MAIN")"
+    run_install_case install_fail_created "$INSTALL_SOURCE" "$CREATED_SITE" "$CREATED_DATA" \
+        "$CREATED_CONF" "$INSTALL_USER"
+    t "新建 pool 的失敗安裝 exit 非 0" false "$(rc install_fail_created 0)"
+    t "本輪新建 pool 已刪除" missing "$(exists "$INSTALL_POOL")"
+    t "本輪加入的 include 已移除" 0 "$(cnt "$INSTALL_MAIN" 'portfolio-fpm.conf')"
+    t "新建 pool 案例主設定精確還原" "$OLD_MAIN_MD5" "$(md5 "$INSTALL_MAIN")"
+    t "新建 pool 案例無關 pool 保持不變" "$OLD_UNRELATED_MD5" "$(md5 "$INSTALL_UNRELATED")"
+    t "本輪新建 extension 片段已刪除" missing "$(exists "$INSTALL_EXT_FILE")"
+    t "extension 模式站台設定逐字節保持不變" "$OLD_CREATED_CONF_MD5" "$(md5 "$CREATED_CONF")"
+    t "extension 模式 Nginx 重載後再次重載還原設定" 2 "$(cnt "$WORK/log/install_fail_created.nginx.log" '-s reload')"
+    t "新建 pool 案例資料目錄已刪除" missing "$(exists "$CREATED_DATA")"
+
+    reset_install_fpm
+    EXISTING_EXT_SITE="$INSTALL_ROOT/fail-existing-ext-site"
+    EXISTING_EXT_DATA="$INSTALL_ROOT/fail-existing-ext-data"
+    EXISTING_EXT_CONF="$INSTALL_NGINX_CONF_DIR/fail-existing-ext.conf"
+    write_install_conf "$EXISTING_EXT_CONF" "$EXISTING_EXT_SITE" extension
+    printf '# synthetic pre-existing extension fragment\n' > "$INSTALL_EXT_FILE"
+    chmod 600 "$INSTALL_EXT_FILE"
+    OLD_EXISTING_EXT_CONF_MD5="$(md5 "$EXISTING_EXT_CONF")"
+    OLD_EXT_MD5="$(md5 "$INSTALL_EXT_FILE")"
+    run_install_case install_fail_existing_ext "$INSTALL_SOURCE" "$EXISTING_EXT_SITE" "$EXISTING_EXT_DATA" \
+        "$EXISTING_EXT_CONF" "$INSTALL_USER"
+    t "既有 extension 片段失敗安裝 exit 非 0" false "$(rc install_fail_existing_ext 0)"
+    t "既有 extension 片段逐字節還原" "$OLD_EXT_MD5" "$(md5 "$INSTALL_EXT_FILE")"
+    t "既有 extension 片段權限還原" 600 "$(stat -c '%a' "$INSTALL_EXT_FILE")"
+    t "既有 extension 案例站台設定保持不變" "$OLD_EXISTING_EXT_CONF_MD5" "$(md5 "$EXISTING_EXT_CONF")"
+    t "既有 extension 案例資料目錄已刪除" missing "$(exists "$EXISTING_EXT_DATA")"
+    rm -f -- "$INSTALL_EXT_FILE"
+
+    rm -f -- "$INSTALL_SOURCE/public/zz-intentional-failure.php"
+    reset_install_fpm
+    OK_SITE="$INSTALL_ROOT/success-site"
+    OK_DATA="$INSTALL_ROOT/custom success data"
+    OK_CONF="$INSTALL_NGINX_CONF_DIR/success.conf"
+    write_install_conf "$OK_CONF" "$OK_SITE"
+    run_install_case install_success "$INSTALL_SOURCE" "$OK_SITE" "$OK_DATA" "$OK_CONF" "$INSTALL_USER"
+    t "一般自訂資料目錄安裝成功" true "$(rc install_success 0)"
+    t "一般安裝 FPM env 使用自訂資料目錄" 1 "$(cnt "$INSTALL_POOL" "env[PORTFOLIO_DATA_DIR] = '$OK_DATA'")"
+    t "一般安裝主設定含 portfolio include" 1 "$(cnt "$INSTALL_MAIN" 'portfolio-fpm.conf')"
+    t "一般安裝 create-admin 收到自訂 PORTFOLIO_DATA_DIR" 1 "$(cnt "$WORK/log/install_success.admin.log" "$OK_DATA")"
+    t "一般安裝 create-admin 收到自訂 --data-dir" 1 "$(cnt "$WORK/log/install_success.admin.log" "--data-dir=$OK_DATA")"
+    printf -v install_cron_data '%q' "$OK_DATA"
+    t "一般安裝 cron 使用同一自訂資料目錄" true "$(has "$WORK/log/install_success.out" "PORTFOLIO_DATA_DIR=$install_cron_data")"
+
+    CLI_SITE="$INSTALL_ROOT/cli-site"
+    CLI_DATA="$INSTALL_ROOT/custom cli data"
+    CLI_CONF="$INSTALL_NGINX_CONF_DIR/cli.conf"
+    write_install_conf "$CLI_CONF" "$CLI_SITE"
+    CLI_POOL_MD5="$(md5 "$INSTALL_POOL")"
+    CLI_MAIN_MD5="$(md5 "$INSTALL_MAIN")"
+    run_install_case install_no_nginx "$INSTALL_SOURCE" "$CLI_SITE" "$CLI_DATA" "$CLI_CONF" \
+        root --no-nginx --skip-php-config
+    t "root --no-nginx 安裝成功" true "$(rc install_no_nginx 0)"
+    t "--no-nginx 不修改既有 pool" "$CLI_POOL_MD5" "$(md5 "$INSTALL_POOL")"
+    t "--no-nginx 不修改 FPM 主設定" "$CLI_MAIN_MD5" "$(md5 "$INSTALL_MAIN")"
+    t "--no-nginx 不執行 PHP-FPM 管理" 0 "$(cnt "$WORK/log/install_no_nginx.fpm.log" 'php-fpm -tt')"
+    t "--no-nginx 不 reload nginx" 0 "$(cnt "$WORK/log/install_no_nginx.nginx.log" '-s reload')"
+    t "--no-nginx create-admin 收到自訂資料目錄" 1 "$(cnt "$WORK/log/install_no_nginx.admin.log" "$CLI_DATA")"
+    t "--no-nginx create-admin 收到自訂 --data-dir" 1 "$(cnt "$WORK/log/install_no_nginx.admin.log" "--data-dir=$CLI_DATA")"
+    printf -v cli_cron_data '%q' "$CLI_DATA"
+    t "--no-nginx cron 使用同一自訂資料目錄" true "$(has "$WORK/log/install_no_nginx.out" "PORTFOLIO_DATA_DIR=$cli_cron_data")"
+    t "--no-nginx 保留程式與資料目錄" present "$(exists "$CLI_DATA")"
+fi
 
 # ============================================================ 10. 假 nginx 的自我檢查
 # 2026-11-22 那輪在真 VPS 上被打回，是因為片段裡的 location 字面跟寶塔 enable-php-83.conf 裡那條一模一樣

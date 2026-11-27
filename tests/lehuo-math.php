@@ -334,18 +334,49 @@ $insert($windowId, '2020-09-30', 100.0, 100.0);
 $insert($windowId, '2024-03-28', 110.0, 111.0);
 $manualBars = Lehuo::bars($windowId, 125.0, '2024-03-31 12:00:00');
 $ok('較新有效人工標價把 42 個月 SQL 起點移到正確日期',
-    array_column($manualBars, 'd') === ['2020-09-30', '2024-03-28', '2024-03-31']
-    && (float) $manualBars[2]['c'] === 125.0 && $manualBars[2]['raw'] === true,
+    array_column($manualBars, 'd') === ['2010-01-04', '2020-09-29', '2020-09-30', '2024-03-28', '2024-03-31']
+    && (float) $manualBars[4]['c'] === 125.0 && $manualBars[4]['raw'] === true,
     json_encode($manualBars));
 $cachedBars = Lehuo::bars($windowId, 125.0, '2024-03-27');
 $ok('較舊人工標價不改變快照日線的 42 個月視窗',
-    array_column($cachedBars, 'd') === ['2020-09-29', '2020-09-30', '2024-03-28']
-    && (float) $cachedBars[2]['c'] === 111.0 && $cachedBars[2]['raw'] === false,
+    array_column($cachedBars, 'd') === ['2010-01-04', '2020-09-29', '2020-09-30', '2024-03-28']
+    && (float) $cachedBars[3]['c'] === 111.0 && $cachedBars[3]['raw'] === false,
     json_encode($cachedBars));
 $sameDayBars = Lehuo::bars($windowId, 130.0, '2024-03-28');
 $ok('同日人工標價仍覆蓋快照日線並標成未含股利',
-    count($sameDayBars) === 3 && (float) $sameDayBars[2]['c'] === 130.0 && $sameDayBars[2]['raw'] === true,
+    count($sameDayBars) === 4 && (float) $sameDayBars[3]['c'] === 130.0 && $sameDayBars[3]['raw'] === true,
     json_encode($sameDayBars));
+
+Database::run("INSERT INTO instruments (symbol,name,market,yahoo_symbol,currency,asset_class) VALUES ('LH-WIDEN','LH-WIDEN','US','LH-WIDEN','USD','EQUITY')");
+$widenId = (int) Database::pdo()->lastInsertId();
+$widenInsert = Database::pdo()->prepare("INSERT INTO prices (instrument_id,as_of,close,adj_close,currency,source) VALUES (?,?,?,?,?,'yahoo')");
+$firstWiden = new DateTimeImmutable('2010-01-04');
+for ($i = 0; $i < 260; $i++) {
+    $widenInsert->execute([$widenId, $firstWiden->modify('+' . ($i * 20) . ' days')->format('Y-m-d'), 100.0 + $i * 0.05, 100.0 + $i * 0.05, 'USD']);
+}
+$widenInsert->execute([$widenId, '2024-03-28', 120.0, 120.0, 'USD']);
+$widenedBars = Lehuo::bars($widenId);
+$widenedSpectrum = Lehuo::spectrum($widenedBars);
+$ok('42 個月不足 250 根時實際補查最早 stored 日線', count($widenedBars) === 261
+    && $widenedBars[0]['d'] === '2010-01-04' && $widenedSpectrum['bars'] === 261,
+    'bars=' . count($widenedBars) . ' from=' . $widenedBars[0]['d']);
+$ok('較早歷史回退如實報告拓寬窗口', str_contains(implode(' ', $widenedSpectrum['warn']), '已補入較早歷史'),
+    implode(' ', $widenedSpectrum['warn']));
+
+Database::run("INSERT INTO instruments (symbol,name,market,yahoo_symbol,currency,asset_class) VALUES ('LH-CAP','LH-CAP','US','LH-CAP','USD','EQUITY')");
+$capId = (int) Database::pdo()->lastInsertId();
+$capInsert = Database::pdo()->prepare("INSERT INTO prices (instrument_id,as_of,close,adj_close,currency,source) VALUES (?,?,?,?,?,'yahoo')");
+$firstCap = new DateTimeImmutable('2006-01-01');
+Database::pdo()->beginTransaction();
+for ($i = 0; $i < 5001; $i++) {
+    $capInsert->execute([$capId, $firstCap->modify('+' . $i . ' days')->format('Y-m-d'), 100.0, 100.0, 'USD']);
+}
+$capInsert->execute([$capId, '2024-03-28', 120.0, 120.0, 'USD']);
+Database::pdo()->commit();
+$cappedBars = Lehuo::bars($capId);
+$ok('較早歷史回退限制每檔最多 5000 根，不把整張表載入', count($cappedBars) === 5001
+    && $cappedBars[0]['d'] === '2006-01-01' && end($cappedBars)['d'] === '2024-03-28',
+    'bars=' . count($cappedBars));
 
 Database::run("INSERT INTO instruments (symbol,name,market,yahoo_symbol,currency,asset_class) VALUES ('LH-MANUAL','LH-MANUAL','US','LH-MANUAL','USD','EQUITY')");
 $manualOnlyId = (int) Database::pdo()->lastInsertId();
@@ -369,6 +400,7 @@ final class StrategyRowsCountingPdo extends PDO
     public int $instrumentQueries = 0;
     public int $newestQueries = 0;
     public int $historyQueries = 0;
+    public int $fallbackQueries = 0;
 
     public function prepare(string $query, array $options = []): PDOStatement|false
     {
@@ -380,6 +412,9 @@ final class StrategyRowsCountingPdo extends PDO
         }
         if (str_starts_with($query, 'WITH cutoff(instrument_id, cutoff)')) {
             $this->historyQueries++;
+        }
+        if (str_starts_with($query, 'WITH needed(instrument_id, cutoff)')) {
+            $this->fallbackQueries++;
         }
 
         return parent::prepare($query, $options);
@@ -395,11 +430,11 @@ $countingPdo = new StrategyRowsCountingPdo('sqlite:' . $dir . '/portfolio.sqlite
 $pdoProperty->setValue(null, $countingPdo);
 $rows = Lehuo::rows();
 $pdoProperty->setValue(null, $originalPdo);
-$ok('策略總表以三次批次查詢載入所有投資物，不再每檔查最新價與歷史',
+$ok('策略總表以批次查詢載入，只對 42 個月不足的標的追加一次早期歷史查詢',
     $countingPdo->instrumentQueries === 1 && $countingPdo->newestQueries === 1
-    && $countingPdo->historyQueries === 1 && count($rows) === 2,
+    && $countingPdo->historyQueries === 1 && $countingPdo->fallbackQueries === 1 && count($rows) === 4,
     'instruments=' . $countingPdo->instrumentQueries . ' newest=' . $countingPdo->newestQueries
-    . ' history=' . $countingPdo->historyQueries . ' rows=' . count($rows));
+    . ' history=' . $countingPdo->historyQueries . ' fallback=' . $countingPdo->fallbackQueries . ' rows=' . count($rows));
 
 echo $fail === 0 ? "ALL PASS\n" : "{$fail} FAILED\n";
 exit($fail === 0 ? 0 : 1);

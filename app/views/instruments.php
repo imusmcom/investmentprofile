@@ -52,6 +52,10 @@
   <?php if ($instruments === []): ?>
     <div class="empty">還沒有投資物，先用上面的表單加入，或直接到<a href="<?= e(url('/transactions')) ?>">交易紀錄</a>輸入代號。</div>
   <?php else: ?>
+    <?php $heldCounts = [];
+    foreach (\App\Database::all('SELECT instrument_id, COUNT(*) AS used FROM transactions GROUP BY instrument_id') as $count) {
+        $heldCounts[(int) $count['instrument_id']] = (int) $count['used'];
+    } ?>
   <div class="table-wrap">
   <table>
     <thead>
@@ -64,9 +68,7 @@
     <?php foreach ($instruments as $i):
         $id = (int) $i['id'];
         $q = $prices[$id] ?? null;
-        $held = \App\Database::scalar(
-            'SELECT COUNT(*) FROM transactions WHERE instrument_id = ?', [$id], 0
-        );
+        $held = $heldCounts[$id] ?? 0;
     ?>
       <tr>
         <td class="left">

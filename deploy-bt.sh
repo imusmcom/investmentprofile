@@ -16,7 +16,8 @@
 #   --php-bin=PATH      要用哪個 PHP（預設自動找 /www/server/php/83|82|81/bin/php，否則 php）
 #   --data-dir=PATH     資料目錄（正式路徑預設 /www/portfolio-data；其他部署預設 <site-dir>/data；相對路徑以 <site-dir> 為基準）
 #   --user=NAME         資料目錄的擁有者／php-fpm 執行帳號（預設先找 www，再找 www-data）
-#   --socket=NAME       php-fpm 的 socket（預設 unix:/tmp/php-cgi-<version>.sock）
+#   --socket=NAME       php-fpm 的 socket（預設 unix:/tmp/portfolio-php-<version>.sock）
+#   --php-etc-dir=PATH  指定 PHP-FPM 設定目錄（合成測試用；--auto 會管理 portfolio pool）
 #   --snapshot=FILE     要當成資料庫搬過去的那份 SQLite（預設找 <data-dir>/import.sqlite）
 #   --domain=URL        已簽好憑證時拿來做線上自查，例如 https://portfolio.example.com
 #   --conf=PATH         寶塔那份站台設定（預設依 --domain 的域名或 --site-dir 自動找）
@@ -39,6 +40,9 @@ DOMAIN_GIVEN=0
 SOCK=""
 CONF=""
 ROOT_DIR=""
+PHP_ETC_DIR=""
+PHP_ETC_DIR_GIVEN=0
+MANAGE_FPM=0
 MODE="check"
 WRITE_NGINX=0
 FORCE_DB=0
@@ -70,12 +74,14 @@ for arg in "$@"; do
         --data-dir=*) DATA_DIR="${arg#*=}"; DATA_DIR_GIVEN=1 ;;
         --user=*) WWW_USER="${arg#*=}" ;;
         --socket=*) SOCK="${arg#*=}" ;;
+        --php-etc-dir=*) PHP_ETC_DIR="${arg#*=}"; PHP_ETC_DIR_GIVEN=1 ;;
+        --manage-fpm) MANAGE_FPM=1 ;;
         --conf=*) CONF="${arg#*=}" ;;
         --root-dir=*) ROOT_DIR="${arg#*=}" ;;
         --snapshot=*) SNAPSHOT="${arg#*=}" ;;
         --domain=*) DOMAIN="${arg#*=}"; DOMAIN_GIVEN=1 ;;
         --help | -h)
-            sed -n '2,27p' "$0"
+            sed -n '2,28p' "$0"
             exit 0
             ;;
         *)
@@ -105,9 +111,21 @@ case "$DATA_DIR" in
     /*) ;;
     *) DATA_DIR="$SITE_DIR/$DATA_DIR" ;;
 esac
+DATA_DIR="${DATA_DIR%/}"
+[ -n "$DATA_DIR" ] || DATA_DIR="/"
+[ "$DATA_DIR" != "/" ] || { echo "--data-dir 不可以是 /" >&2; exit 2; }
+if [ "$PHP_ETC_DIR_GIVEN" = "1" ]; then
+    case "$PHP_ETC_DIR" in
+        /*) ;;
+        *) echo "--php-etc-dir 必須是絕對路徑" >&2; exit 2 ;;
+    esac
+    PHP_ETC_DIR="${PHP_ETC_DIR%/}"
+    MANAGE_FPM=1
+fi
 NGINX_FRAGMENT="$SITE_DIR/deploy-portfolio.conf"
 # 片段第一行帶著這個字串，重複跑時用它辨認「這段是腳本放的」，才不會插第二次。
 FRAGMENT_TAG="deploy-bt.sh 放的部署片段"
+FRAGMENT_END_TAG="deploy-bt.sh managed fragment end"
 
 validate_domain() {
     local port=""
@@ -164,6 +182,15 @@ else
     PHP_VER_MAJOR="${PHP_V%%.*}"
     PHP_VER_MINOR="${PHP_V#*.}"
     PHP_VER_SHORT="${PHP_VER_MAJOR}${PHP_VER_MINOR%%.*}"
+    if [ "$MANAGE_FPM" = "0" ] && [ "$WRITE_NGINX" = "1" ]; then
+        case "$PHP_BIN" in
+            /www/server/php/*/bin/php)
+                PHP_DIR="$(cd -- "$(dirname -- "$PHP_BIN")/.." && pwd)"
+                PHP_ETC_DIR="$PHP_DIR/etc"
+                MANAGE_FPM=1
+                ;;
+        esac
+    fi
     ok "用 $PHP_BIN（PHP $PHP_V）"
     if "$PHP_BIN" -r 'exit(version_compare(PHP_VERSION, "8.1.0", "<") ? 1 : 0);' >/dev/null 2>&1; then
         ok "版本符合 8.1 以上"
@@ -484,6 +511,11 @@ if [ "$TREE_OK" = "1" ] && [ -d "$DATA_DIR" ]; then
     done
 
     if do_it && [ -n "$WWW_USER" ]; then
+        if [ -L "$DATA_DIR/sessions" ] || { [ -e "$DATA_DIR/sessions" ] && [ ! -d "$DATA_DIR/sessions" ]; }; then
+            bad "session 目錄是符號連結或非資料夾，拒絕使用：$DATA_DIR/sessions"
+        elif ! mkdir -p -- "$DATA_DIR/sessions"; then
+            bad "建不了 session 目錄：$DATA_DIR/sessions"
+        fi
         if chown -R -- "$WWW_USER:$WWW_USER" "$DATA_DIR"; then
             ok "chown -R $WWW_USER:$WWW_USER $DATA_DIR"
         else
@@ -492,6 +524,9 @@ if [ "$TREE_OK" = "1" ] && [ -d "$DATA_DIR" ]; then
         chmod 750 -- "$DATA_DIR" || bad "chmod 750 失敗：$DATA_DIR"
         if [ -d "$BACKUP_DIR" ] && [ ! -L "$BACKUP_DIR" ]; then
             chmod 700 -- "$BACKUP_DIR" || bad "備份目錄 chmod 700 失敗：$BACKUP_DIR"
+        fi
+        if [ -d "$DATA_DIR/sessions" ] && [ ! -L "$DATA_DIR/sessions" ]; then
+            chmod 700 -- "$DATA_DIR/sessions" || bad "session 目錄 chmod 700 失敗：$DATA_DIR/sessions"
         fi
         PERM_FAIL_BEFORE="$FAILS"
         for dbf in "${FORMAL_DB_FILES[@]}"; do
@@ -536,7 +571,7 @@ fi
 # ---------- 5. nginx ----------
 echo "== 5. nginx =="
 if [ "$TREE_OK" = "1" ]; then
-    [ -n "$SOCK" ] || SOCK="unix:/tmp/php-cgi-$PHP_VER_SHORT.sock"
+    [ -n "$SOCK" ] || SOCK="unix:/tmp/portfolio-php-$PHP_VER_SHORT.sock"
     printf '       fastcgi socket：%s\n' "$SOCK"
     [ -n "$ROOT_DIR" ] || ROOT_DIR="$SITE_DIR/public"
 
@@ -590,6 +625,201 @@ root $ROOT_DIR;"
         printf '       網頁根：%s\n' "${LIVE_ROOT:-從站台設定讀不到（站台還沒建？用 --conf= 指給我看）}"
     fi
 
+    fpm_quote() {
+        local value="$1"
+        value="${value//\\/\\\\}"
+        value="${value//\'/\\\'}"
+        printf "'%s'" "$value"
+    }
+
+    POOL_BACKUP=""
+    INCLUDE_BACKUP=""
+    POOL_CHANGED=0
+    INCLUDE_CHANGED=0
+    backup_managed_file() {
+        local source="$1" stamp candidate
+        stamp="$(date +%Y%m%d-%H%M%S)"
+        candidate="$source.bak-$stamp"
+        while [ -e "$candidate" ] || [ -L "$candidate" ]; do
+            candidate="$candidate-$$"
+        done
+        if ! cp -p -- "$source" "$candidate" || ! cmp -s -- "$source" "$candidate"; then
+            return 1
+        fi
+        BACKUP_PATH="$candidate"
+    }
+
+    pool_fragment() {
+        cat <<POOL
+# deploy-bt.sh managed portfolio PHP-FPM pool; regenerated idempotently.
+[portfolio]
+user = $WWW_USER
+group = $WWW_USER
+listen = ${SOCK#unix:}
+POOL
+        case "$SOCK" in
+            unix:*)
+                printf 'listen.owner = %s\nlisten.group = %s\nlisten.mode = 0660\n' "$WWW_USER" "$WWW_USER"
+                ;;
+            *)
+                printf 'listen.allowed_clients = 127.0.0.1\n'
+                ;;
+        esac
+        cat <<POOL
+listen.backlog = 8192
+pm = ondemand
+pm.max_children = 10
+pm.process_idle_timeout = 30s
+request_terminate_timeout = 610
+catch_workers_output = yes
+security.limit_extensions = .php
+
+env[PORTFOLIO_DATA_DIR] = $(fpm_quote "$DATA_DIR")
+php_admin_value[session.save_path] = $(fpm_quote "$DATA_DIR/sessions")
+php_admin_value[upload_max_filesize] = 64M
+php_admin_value[post_max_size] = 64M
+php_admin_value[date.timezone] = Asia/Hong_Kong
+php_admin_value[max_execution_time] = 600
+php_admin_flag[display_errors] = off
+php_admin_flag[log_errors] = on
+php_admin_flag[opcache.enable] = on
+php_admin_value[opcache.memory_consumption] = 128
+php_admin_value[opcache.interned_strings_buffer] = 16
+php_admin_value[opcache.max_accelerated_files] = 10000
+php_admin_value[opcache.revalidate_freq] = 2
+POOL
+    }
+
+    rollback_pool() {
+        if [ "$POOL_CHANGED" = "1" ]; then
+            if [ -n "$POOL_BACKUP" ]; then
+                cp -p -- "$POOL_BACKUP" "$POOL_FILE" || bad "PHP-FPM pool 還原失敗：$POOL_FILE"
+            else
+                rm -f -- "$POOL_FILE" || bad "新建 PHP-FPM pool 刪除失敗：$POOL_FILE"
+            fi
+        fi
+        if [ "$INCLUDE_CHANGED" = "1" ]; then
+            if [ -n "$INCLUDE_BACKUP" ]; then
+                cp -p -- "$INCLUDE_BACKUP" "$PHP_FPM_CONF" || bad "PHP-FPM 主設定還原失敗：$PHP_FPM_CONF"
+            else
+                rm -f -- "$PHP_FPM_CONF" || bad "新建 PHP-FPM 主設定刪除失敗：$PHP_FPM_CONF"
+            fi
+        fi
+    }
+
+    manage_pool() {
+        if [ "$MANAGE_FPM" != "1" ]; then
+            return
+        fi
+        if [ "$PHP_OK" != "1" ] || [ -z "$WWW_USER" ] || [ "$WWW_USER" = "root" ]; then
+            bad "沒有可用的非 root PHP-FPM 執行帳號，拒絕管理 portfolio pool"
+            return
+        fi
+        if [ -z "$PHP_ETC_DIR" ] || [ ! -d "$PHP_ETC_DIR" ] || [ -L "$PHP_ETC_DIR" ]; then
+            bad "PHP-FPM 設定目錄不存在或不可識別：$PHP_ETC_DIR"
+            return
+        fi
+        POOL_FILE="$PHP_ETC_DIR/portfolio-fpm.conf"
+        PHP_FPM_CONF="$PHP_ETC_DIR/php-fpm.conf"
+        if [ -L "$POOL_FILE" ] || { [ -e "$POOL_FILE" ] && [ ! -f "$POOL_FILE" ]; }; then
+            bad "portfolio pool 是符號連結或非一般檔案，拒絕覆蓋：$POOL_FILE"
+            return
+        fi
+        local pool_tmp="$POOL_FILE.new.$$" include_tmp="$PHP_FPM_CONF.new.$$"
+        if [ -e "$pool_tmp" ] || [ -L "$pool_tmp" ] || [ -e "$include_tmp" ] || [ -L "$include_tmp" ]; then
+            bad "PHP-FPM 設定暫存檔已存在，拒絕猜測覆蓋"
+            return
+        fi
+        if ! pool_fragment > "$pool_tmp"; then
+            bad "無法產生 portfolio pool：$POOL_FILE"
+            rm -f -- "$pool_tmp"
+            return
+        fi
+        chmod 644 "$pool_tmp"
+        if [ -f "$POOL_FILE" ] && cmp -s -- "$POOL_FILE" "$pool_tmp"; then
+            rm -f -- "$pool_tmp"
+            ok "portfolio pool 已符合資料目錄、socket 與 OPcache 設定，未重寫"
+        else
+            if [ -f "$POOL_FILE" ]; then
+                if ! backup_managed_file "$POOL_FILE"; then
+                    bad "既有 portfolio pool 無法備份，拒絕覆蓋"
+                    rm -f -- "$pool_tmp"
+                    return
+                fi
+                POOL_BACKUP="$BACKUP_PATH"
+                chmod --reference="$POOL_FILE" "$pool_tmp"
+                ok "既有 portfolio pool 已備份：$POOL_BACKUP"
+            fi
+            if ! mv -fT -- "$pool_tmp" "$POOL_FILE"; then
+                bad "portfolio pool 寫入失敗"
+                rm -f -- "$pool_tmp"
+                return
+            fi
+            POOL_CHANGED=1
+            ok "portfolio pool 已更新（含 PORTFOLIO_DATA_DIR 與專用 OPcache）"
+        fi
+
+        # BaoTa's stock php-fpm.conf does not necessarily include our pool yet. Add exactly one active,
+        # absolute include; an already active equivalent (optionally quoted) is left byte-for-byte alone.
+        if [ ! -f "$PHP_FPM_CONF" ] || [ -L "$PHP_FPM_CONF" ]; then
+            bad "PHP-FPM 主設定不存在或是符號連結，拒絕修改：$PHP_FPM_CONF"
+            rollback_pool || true
+            return
+        fi
+        local escaped_pool include_re
+        escaped_pool="$(printf '%s' "$POOL_FILE" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+        include_re="^[[:space:]]*include[[:space:]]*=[[:space:]]*[\"']?${escaped_pool}[\"']?[[:space:]]*;?[[:space:]]*$"
+        if nginx_uncommented "$PHP_FPM_CONF" | grep -Eq "$include_re"; then
+            ok "PHP-FPM 主設定已包含 portfolio pool，未重複插入"
+        else
+            if ! backup_managed_file "$PHP_FPM_CONF"; then
+                bad "PHP-FPM 主設定無法備份，拒絕加入 include"
+                rollback_pool || true
+                return
+            fi
+            INCLUDE_BACKUP="$BACKUP_PATH"
+            if ! { cat "$PHP_FPM_CONF"; printf '\n# deploy-bt.sh managed portfolio pool include\ninclude = %s\n' "$(fpm_quote "$POOL_FILE")"; } > "$include_tmp"; then
+                bad "無法產生 PHP-FPM include"
+                rm -f -- "$include_tmp"
+                rollback_pool || true
+                return
+            fi
+            chmod --reference="$PHP_FPM_CONF" "$include_tmp"
+            if ! mv -fT -- "$include_tmp" "$PHP_FPM_CONF"; then
+                bad "PHP-FPM include 寫入失敗"
+                rm -f -- "$include_tmp"
+                rollback_pool || true
+                return
+            fi
+            INCLUDE_CHANGED=1
+            ok "PHP-FPM 主設定已加入 portfolio pool include"
+        fi
+
+        local fpm_bin="$(dirname -- "$PHP_ETC_DIR")/sbin/php-fpm"
+        if [ ! -x "$fpm_bin" ]; then
+            bad "找不到 PHP-FPM 可執行檔：$fpm_bin"
+            rollback_pool || true
+            return
+        fi
+        if ! "$fpm_bin" -tt >/dev/null 2>&1; then
+            bad "PHP-FPM 設定檢查失敗，已還原本輪 pool／include 改動"
+            rollback_pool || true
+            return
+        fi
+        ok "PHP-FPM -tt 通過（OPcache 128M、revalidate_freq 2）"
+        if systemctl is-active --quiet "php-fpm-${PHP_VER_SHORT}" 2>/dev/null; then
+            if systemctl reload "php-fpm-${PHP_VER_SHORT}"; then
+                ok "PHP-FPM 已重載，資料目錄與 OPcache 設定生效"
+            else
+                bad "PHP-FPM reload 失敗，請手動重啟；pool 備份仍在"
+            fi
+        else
+            warn "PHP-FPM 服務未由 systemctl 管理或尚未啟動，請在寶塔重啟 PHP $PHP_VER_SHORT"
+        fi
+        [ -z "$POOL_BACKUP" ] || echo "       portfolio pool 備份：$POOL_BACKUP"
+        [ -z "$INCLUDE_BACKUP" ] || echo "       PHP-FPM 主設定備份：$INCLUDE_BACKUP"
+    }
+
     fragment() {
         cat <<NGINX
 # $FRAGMENT_TAG
@@ -614,6 +844,7 @@ location ~ [^/]\.php(/.*)?\$ {
     # nginx sends the server-scope frame policy; suppress PHP's duplicate header.
     fastcgi_hide_header X-Frame-Options;
 }
+# END $FRAGMENT_END_TAG
 NGINX
     }
 
@@ -682,6 +913,103 @@ NGINX
         else
             ROLLBACK_NOTE="這一次只動過那個片段檔，已刪除；寶塔的主設定檔這輪一個字都沒改。"
         fi
+    }
+
+    inline_server_close() {
+        nginx_uncommented "$1" | grep -n '^}' | tail -1 | cut -d: -f1 || true
+    }
+
+    # Locate our inline block. New fragments have an explicit end marker. The old format had no end
+    # marker: recognize its generated PHP location and stop at that location's matching brace (which
+    # may be indented), rather than guessing from the next column-zero brace. Unknown directives
+    # between the start tag and that location make the boundary ambiguous and are left untouched.
+    inline_fragment_bounds() {
+        local file="$1" starts ends close expected_location
+        starts="$(grep -nFx -- "# $FRAGMENT_TAG" "$file" | cut -d: -f1 || true)"
+        ends="$(grep -nFx -- "# END $FRAGMENT_END_TAG" "$file" | cut -d: -f1 || true)"
+        if [ -z "$starts" ] || [ "$(printf '%s\n' "$starts" | wc -l)" != "1" ]; then
+            return 2
+        fi
+        if [ -n "$ends" ]; then
+            if [ "$(printf '%s\n' "$ends" | wc -l)" != "1" ] || [ "$ends" -le "$starts" ]; then
+                return 2
+            fi
+        else
+            close="$(inline_server_close "$file")"
+            if [ -z "$close" ] || [ "$close" -le "$starts" ]; then
+                return 2
+            fi
+            expected_location='location ~ [^/]\.php(/.*)?$ {'
+            ends="$(LEGACY_LOCATION="$expected_location" awk -v start="$starts" -v server_close="$close" '
+                BEGIN { expected = ENVIRON["LEGACY_LOCATION"] }
+                NR > start && NR < server_close {
+                    line = $0
+                    sub(/^[[:space:]]+/, "", line)
+                    sub(/[[:space:]]+$/, "", line)
+                    sub(/[[:space:]]*#.*$/, "", line)
+                    if (line == "") next
+                    if (!in_location) {
+                        if (line == expected) { in_location = 1; depth = 1; next }
+                        if (line ~ /^client_max_body_size[[:space:]]/ ||
+                            line ~ /^add_header[[:space:]]+(X-Frame-Options|Strict-Transport-Security)[[:space:]]/ ||
+                            line ~ /^root[[:space:]]/) next
+                        ambiguous = 1
+                        exit
+                    }
+                    opens = gsub(/\{/, "{", line)
+                    closes = gsub(/\}/, "}", line)
+                    depth += opens - closes
+                    if (depth <= 0) { print NR; exit }
+                }
+                END { if (ambiguous) exit 2 }
+            ' "$file")" || return 2
+            if [ -z "$ends" ] || [ "$ends" -ge "$close" ]; then
+                return 2
+            fi
+        fi
+        printf '%s %s\n' "$starts" "$ends"
+    }
+
+    inline_fragment_matches() {
+        local bounds start end
+        bounds="$(inline_fragment_bounds "$1")" || return 2
+        read -r start end <<< "$bounds"
+        { head -n "$((start - 1))" "$1"; cat "$NGINX_FRAGMENT"; tail -n "+$((end + 1))" "$1"; } \
+            | cmp -s -- "$1" -
+    }
+
+    replace_inline_fragment() {
+        local file="$1" bounds start end
+        bounds="$(inline_fragment_bounds "$file")" || {
+            bad "無法安全辨識既有 inline 片段邊界，拒絕覆蓋：$file"
+            return 1
+        }
+        read -r start end <<< "$bounds"
+        local tmp="$file.new.$$"
+        if [ -e "$tmp" ] || [ -L "$tmp" ]; then
+            bad "站台設定暫存檔已存在，拒絕猜測覆蓋：$tmp"
+            return 1
+        fi
+        if ! backup_managed_file "$file"; then
+            bad "既有站台設定無法備份，拒絕更新 inline 片段"
+            return 1
+        fi
+        CONF_BACKUP="$BACKUP_PATH"
+        if ! { head -n "$((start - 1))" "$file"; cat "$NGINX_FRAGMENT"; tail -n "+$((end + 1))" "$file"; } > "$tmp"; then
+            bad "無法替換 inline 片段，原設定未變"
+            rm -f -- "$tmp"
+            return 1
+        fi
+        chmod --reference="$file" "$tmp"
+        if ! mv -fT -- "$tmp" "$file"; then
+            bad "inline 片段換寫失敗，原設定未變"
+            rm -f -- "$tmp"
+            return 1
+        fi
+        PATCH_MODE="inline"
+        PATCHED_CONF=1
+        ok "既有 inline 片段已比對並更新，沒有重複插入；原檔留成 $CONF_BACKUP"
+        ROLLBACK_NOTE="要恢復原樣：cp $CONF_BACKUP $CONF_PATH && nginx -t && nginx -s reload。"
     }
 
     patch_conf() {
@@ -760,7 +1088,11 @@ NGINX
                 ROLLBACK_NOTE="要恢復原樣：rm $PATCH_FILE 然後 nginx -t && nginx -s reload；主設定檔沒動過。"
             fi
         elif grep -qFx -- "# $FRAGMENT_TAG" "$CONF_PATH"; then
-            ok "這份設定裡已經有上次插進去的那段，所以不重複插入（要重放請先把它從設定裡移除）"
+            if inline_fragment_matches "$CONF_PATH"; then
+                ok "這份設定裡已經有上次插進去的那段且設定一致，所以不重複插入"
+            else
+                replace_inline_fragment "$CONF_PATH" || return 0
+            fi
         else
             PATCH_MODE="inline"
             local close
@@ -817,8 +1149,13 @@ NGINX
         else
             bad "nginx 片段寫不下去：$NGINX_FRAGMENT"
         fi
-        if [ "$WRITE_NGINX" = "1" ]; then
+        if [ "$FAILS" = "0" ]; then
+            manage_pool
+        fi
+        if [ "$WRITE_NGINX" = "1" ] && [ "$FAILS" = "0" ]; then
             patch_conf
+        elif [ "$WRITE_NGINX" = "1" ]; then
+            skip "動站台設定（PHP-FPM 設定未通過，避免 Nginx 指向未驗證的 socket）"
         else
             skip "動站台設定（這次只 --apply，片段檔已寫好；要一條指令裝完就用 --auto）"
         fi
@@ -835,7 +1172,7 @@ if [ "$TREE_OK" = "1" ] && [ "$PHP_OK" = "1" ]; then
         skip "真跑一次報價更新"
     elif do_it; then
         RC=0
-        ( cd "$SITE_DIR" && "$PHP_BIN" bin/refresh-prices.php --data-dir="$DATA_DIR" ) || RC=$?
+        ( cd "$SITE_DIR" && PORTFOLIO_DATA_DIR="$DATA_DIR" "$PHP_BIN" bin/refresh-prices.php --data-dir="$DATA_DIR" ) || RC=$?
         if [ "$RC" = "0" ]; then
             ok "refresh-prices.php 回 0：這台抓得到 Yahoo，排程放下去就有報價"
         else
@@ -882,8 +1219,13 @@ if [ "$TREE_OK" = "1" ] && [ "$PHP_OK" = "1" ]; then
         skip "時間戳比對（$TARGET_DB 還沒就位）"
     fi
 
-    echo "       排程那一行（面板上的排程工作，類型選 Shell 腳本）："
-    echo "       cd $SITE_DIR && $PHP_BIN bin/refresh-prices.php --data-dir=$DATA_DIR >> $DATA_DIR/refresh.log 2>&1"
+    echo "       排程那一行（面板上的排程工作，類型選 Shell 腳本；環境與 CLI 參數都指向同一資料庫）："
+    printf -v cron_site '%q' "$SITE_DIR"
+    printf -v cron_php '%q' "$PHP_BIN"
+    printf -v cron_data '%q' "$DATA_DIR"
+    printf -v cron_log '%q' "$DATA_DIR/refresh.log"
+    echo "       cd $cron_site && PORTFOLIO_DATA_DIR=$cron_data $cron_php bin/refresh-prices.php --data-dir=$cron_data >> $cron_log 2>&1"
+    echo "       建立／更新帳號也用同一份資料庫：cd $cron_site && PORTFOLIO_DATA_DIR=$cron_data $cron_php bin/create-admin.php --username=你的帳號 --data-dir=$cron_data"
 fi
 
 # ---------- 7. 線上自查 ----------
@@ -944,7 +1286,7 @@ fi
 echo "還要在面板上做、腳本故意不碰的："
 echo "  1. 網站目錄 → 執行目錄 設成 /public（第 7 步就是用來驗它有生效；--auto 補的那行 root 是暫時代替，面板上改才不會在重新生成設定時被洗掉）"
 echo "  2. Let's Encrypt 簽憑證 + 強制 HTTPS（有 TLS 之後 session cookie 自動帶 Secure，不用改 app/config.php）"
-echo "  3. 專用 PHP pool（後續受控步驟）：用 --socket、--user、--data-dir 對應實際 pool；上傳上限 64M 與 date.timezone = Asia/Hong_Kong 設在該 pool，不改共用 php.ini"
+echo "  3. --auto 會為寶塔 PHP 產生／更新專用 portfolio pool（--socket、--user、--data-dir、64M 上傳、HKT、專用 OPcache）；其他 PHP 執行環境請自行設定等效 pool"
 echo "  4. 面板端口 + 安全入口 + IP 白名單；防火牆只留 80/443/SSH/面板端口"
 echo "  5. 把第 6 步印出的那行排程加進面板的排程工作"
 if [ -n "$ROLLBACK_NOTE" ]; then

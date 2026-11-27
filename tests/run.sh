@@ -89,7 +89,7 @@ echo "smoke 使用臨時資料庫：$DB"
 echo "smoke 使用本機位址：$BASE"
 echo "deploy-auto harness（合成快照，不讀正式資料）"
 set +e
-TMPDIR=/tmp PHP_BIN="$PHPBIN" bash "$ROOT/tests/deploy-auto-harness.sh"
+SNAPSHOT_SRC= TMPDIR=/tmp PHP_BIN="$PHPBIN" bash "$ROOT/tests/deploy-auto-harness.sh"
 RC=$?
 set -e
 [ "$RC" -eq 0 ] || FAILED=1

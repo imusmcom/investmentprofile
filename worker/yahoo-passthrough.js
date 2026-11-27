@@ -44,6 +44,25 @@ const tokenQuotas = new Map();
 
 export default {
     async fetch(request, env) {
+        // Rate-limit the source before checking the token, so guesses cannot consume upstream capacity.
+        const sourceIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+        if (env.QUOTE_RATE_LIMITER) {
+            let decision;
+            try {
+                decision = await env.QUOTE_RATE_LIMITER.limit({ key: `ip:${sourceIp}` });
+            } catch {
+                return refuse(503, 'Worker rate limiter unavailable', QUOTA_WINDOW_MS / 1000);
+            }
+            if (!decision.success) {
+                return refuse(429, 'Worker quota exceeded', QUOTA_WINDOW_MS / 1000);
+            }
+        } else {
+            const decision = takeQuota(ipQuotas, `ip:${sourceIp}`, Date.now());
+            if (!decision.allowed) {
+                return refuse(429, 'Worker quota exceeded', decision.retryAfter);
+            }
+        }
+
         const expectedToken = env.QUOTE_TOKEN;
         if (typeof expectedToken !== 'string' || expectedToken.trim() === ''
             || !tokenMatches(request.headers.get('X-Quote-Token'), expectedToken)) {
@@ -60,31 +79,23 @@ export default {
             return refuse(404, 'this worker only forwards the chart endpoint');
         }
 
-        // Cloudflare sets CF-Connecting-IP; never trust a caller-supplied X-Forwarded-For here.
-        const sourceIp = request.headers.get('CF-Connecting-IP') || 'unknown';
         const tokenDigest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(expectedToken));
         const tokenHash = Array.from(new Uint8Array(tokenDigest), byte => byte.toString(16).padStart(2, '0')).join('');
         // Binding keys are ip:<source IP> and token:<SHA-256 token hash>; configure 60/60s in Cloudflare.
         if (env.QUOTE_RATE_LIMITER) {
-            for (const key of [`ip:${sourceIp}`, `token:${tokenHash}`]) {
-                let decision;
-                try {
-                    decision = await env.QUOTE_RATE_LIMITER.limit({ key });
-                } catch {
-                    // A configured distributed guard must fail closed if the binding is unavailable.
-                    return refuse(503, 'Worker rate limiter unavailable', QUOTA_WINDOW_MS / 1000);
-                }
-                if (!decision.success) {
-                    return refuse(429, 'Worker quota exceeded', QUOTA_WINDOW_MS / 1000);
-                }
+            let decision;
+            try {
+                decision = await env.QUOTE_RATE_LIMITER.limit({ key: `token:${tokenHash}` });
+            } catch {
+                return refuse(503, 'Worker rate limiter unavailable', QUOTA_WINDOW_MS / 1000);
+            }
+            if (!decision.success) {
+                return refuse(429, 'Worker quota exceeded', QUOTA_WINDOW_MS / 1000);
             }
         } else {
-            const now = Date.now();
-            for (const [store, key] of [[ipQuotas, `ip:${sourceIp}`], [tokenQuotas, `token:${tokenHash}`]]) {
-                const decision = takeQuota(store, key, now);
-                if (!decision.allowed) {
-                    return refuse(429, 'Worker quota exceeded', decision.retryAfter);
-                }
+            const decision = takeQuota(tokenQuotas, `token:${tokenHash}`, Date.now());
+            if (!decision.allowed) {
+                return refuse(429, 'Worker quota exceeded', decision.retryAfter);
             }
         }
 
@@ -142,7 +153,7 @@ async function fetchUpstream(url, headers) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
-        const reply = await fetch(url, { headers, redirect: 'follow', signal: controller.signal });
+        const reply = await fetch(url, { headers, redirect: 'manual', signal: controller.signal });
         return { reply, controller, timer };
     } catch {
         clearTimeout(timer);

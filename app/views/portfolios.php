@@ -2,7 +2,9 @@
 
 <div class="page-title">
   <h2>投資組合</h2>
-  <span class="meta">每個組合各自計算持股與損益，投資物資料庫共用以避免同一個投資物重複抓價</span>
+  <span class="meta">每個組合各自計算持股與損益，投資物資料庫共用以避免同一個投資物重複抓價
+    <?= !empty($aggregate) ? '｜總覽範圍：所有組合' : '' ?>
+  </span>
 </div>
 
 <div class="panel">

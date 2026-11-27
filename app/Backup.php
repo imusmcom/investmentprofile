@@ -37,13 +37,47 @@ final class Backup
         'portfolios', 'instruments', 'transactions', 'cash_movements',
     ];
 
+    /** Numeric payloads; identifiers are checked separately so they must be positive integers. */
     private const NUMERIC_COLUMNS = [
-        'portfolios' => ['id'],
-        'instruments' => ['id', 'manual_price'],
-        'transactions' => ['id', 'portfolio_id', 'instrument_id', 'quantity', 'price', 'fee'],
-        'cash_movements' => ['id', 'portfolio_id', 'amount'],
-        'prices' => ['instrument_id', 'close', 'high', 'low', 'prev_close', 'adj_close'],
+        'portfolios' => [],
+        'instruments' => ['manual_price'],
+        'transactions' => ['quantity', 'price', 'fee'],
+        'cash_movements' => ['amount'],
+        'prices' => ['close', 'high', 'low', 'prev_close', 'adj_close'],
         'fx_rates' => ['units_per_usd', 'manual'],
+        'settings' => [],
+    ];
+
+    /** The key columns the live tables rely on for uniqueness and conflict handling. */
+    private const PRIMARY_KEYS = [
+        'portfolios' => ['id'],
+        'instruments' => ['id'],
+        'transactions' => ['id'],
+        'cash_movements' => ['id'],
+        'prices' => ['instrument_id', 'as_of'],
+        'fx_rates' => ['currency'],
+        'settings' => ['key'],
+    ];
+
+    /** Every identifier copied as an integer, including table-local and foreign keys. */
+    private const ID_COLUMNS = [
+        'portfolios' => ['id'],
+        'instruments' => ['id'],
+        'transactions' => ['id', 'portfolio_id', 'instrument_id'],
+        'cash_movements' => ['id', 'portfolio_id'],
+        'prices' => ['instrument_id'],
+        'fx_rates' => [],
+        'settings' => [],
+    ];
+
+    /** Dates whose exact format and validity are required by the current application schema. */
+    private const DATE_COLUMNS = [
+        'portfolios' => [],
+        'instruments' => [],
+        'transactions' => ['traded_on'],
+        'cash_movements' => ['moved_on'],
+        'prices' => ['as_of'],
+        'fx_rates' => ['as_of'],
         'settings' => [],
     ];
 
@@ -55,13 +89,18 @@ final class Backup
         $config = require __DIR__ . '/config.php';
         $dir = rtrim((string) $config['data_dir'], "/\\") . '/backups';
 
-        if (!is_dir($dir) && !@mkdir($dir, 0750, true) && !is_dir($dir)) {
-            error_log("無法建立備份資料夾：{$dir}");
-            throw new RuntimeException('無法建立備份資料夾，請檢查伺服器設定。');
-        }
-        if (!@chmod($dir, 0750)) {
-            error_log("無法設定備份資料夾權限：{$dir}");
-            throw new RuntimeException('無法設定備份資料夾權限，請檢查伺服器設定。');
+        if (!is_dir($dir)) {
+            $created = @mkdir($dir, 0750, true);
+            if (!$created && !is_dir($dir)) {
+                error_log("無法建立備份資料夾：{$dir}");
+                throw new RuntimeException('無法建立備份資料夾，請檢查伺服器設定。');
+            }
+            // Another request may win the mkdir race; it owns securing the directory it just created.
+            // Never chmod an existing directory: its owner may deliberately keep it private.
+            if ($created && !@chmod($dir, 0750)) {
+                error_log("無法設定新建備份資料夾權限：{$dir}");
+                throw new RuntimeException('無法設定新建備份資料夾權限，請檢查伺服器設定。');
+            }
         }
 
         return $dir;
@@ -416,6 +455,8 @@ final class Backup
 
             $columns = self::columnPlan($main, $source);
             self::validateNumericTypes($source, $columns);
+            self::validateIds($source, $columns);
+            self::validateDates($source, $columns);
             $counts = self::sourceCounts($source, $columns);
             if ($source->query('PRAGMA foreign_key_check')->fetchAll() !== []) {
                 throw new UserError('備份檔的資料關聯不一致，不會覆蓋任何資料。');
@@ -453,6 +494,12 @@ final class Backup
                 throw new UserError("備份檔的「{$table}」缺少欄位：" . implode('、', $missing) . '。它太舊了，不能拿來還原。');
             }
 
+            // A different key shape can make a seemingly valid copy collide or lose rows. Compare
+            // ordinals, not just the set of names, because prices is a composite key.
+            if (self::primaryKey($source, $table) !== self::PRIMARY_KEYS[$table]) {
+                throw new UserError("備份檔的「{$table}」主鍵結構不相容，不會覆蓋任何資料。");
+            }
+
             $plan[$table] = array_map(
                 static fn (string $c): string => self::identifier($c),
                 $ours
@@ -475,16 +522,83 @@ final class Backup
                     continue;
                 }
                 $quoted = self::identifier($column);
-                $checks[] = "({$quoted} IS NOT NULL AND typeof({$quoted}) NOT IN ('integer', 'real'))";
+                // SQLite can store 1e999 as REAL infinity even when a CHECK such as value > 0
+                // succeeds. Comparing against the IEEE-754 limit rejects both signs without
+                // overflowing abs() on the minimum 64-bit integer. SQLite NaN becomes NULL.
+                $checks[] = "({$quoted} IS NOT NULL AND (typeof({$quoted}) NOT IN ('integer', 'real')"
+                    . " OR {$quoted} > 1.7976931348623157e308"
+                    . " OR {$quoted} < -1.7976931348623157e308))";
             }
             if ($checks === []) {
                 continue;
             }
             $bad = (int) $source->query('SELECT COUNT(*) FROM main.' . $table . ' WHERE ' . implode(' OR ', $checks))->fetchColumn();
             if ($bad > 0) {
-                throw new UserError("備份檔的「{$table}」有 {$bad} 列數值欄位型別不正確，不會覆蓋任何資料。");
+                throw new UserError("備份檔的「{$table}」有 {$bad} 列數值不是有限數值，不會覆蓋任何資料。");
             }
         }
+    }
+
+    private static function validateIds(PDO $source, array $plan): void
+    {
+        foreach (self::ID_COLUMNS as $table => $ids) {
+            $available = array_map(static fn (string $column): string => trim($column, '"'), $plan[$table]);
+            $checks = [];
+            foreach ($ids as $column) {
+                if (!in_array($column, $available, true)) {
+                    continue;
+                }
+                $quoted = self::identifier($column);
+                $checks[] = "(typeof({$quoted}) <> 'integer' OR {$quoted} <= 0)";
+            }
+            if ($checks === []) {
+                continue;
+            }
+            $bad = (int) $source->query('SELECT COUNT(*) FROM main.' . $table . ' WHERE ' . implode(' OR ', $checks))->fetchColumn();
+            if ($bad > 0) {
+                throw new UserError("備份檔的「{$table}」有 {$bad} 列識別欄位不是正整數，不會覆蓋任何資料。");
+            }
+        }
+    }
+
+    private static function validateDates(PDO $source, array $plan): void
+    {
+        foreach (self::DATE_COLUMNS as $table => $dates) {
+            $available = array_map(static fn (string $column): string => trim($column, '"'), $plan[$table]);
+            $checks = [];
+            foreach ($dates as $column) {
+                if (!in_array($column, $available, true)) {
+                    continue;
+                }
+                $quoted = self::identifier($column);
+                $checks[] = "(typeof({$quoted}) <> 'text'"
+                    . " OR {$quoted} NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'"
+                    . " OR date({$quoted}) IS NULL OR date({$quoted}) <> {$quoted})";
+            }
+            if ($checks === []) {
+                continue;
+            }
+            $bad = (int) $source->query('SELECT COUNT(*) FROM main.' . $table . ' WHERE ' . implode(' OR ', $checks))->fetchColumn();
+            if ($bad > 0) {
+                throw new UserError("備份檔的「{$table}」有 {$bad} 列日期不正確，不會覆蓋任何資料。");
+            }
+        }
+    }
+
+    /** @return list<string> primary-key columns in their declared ordinal order */
+    private static function primaryKey(PDO $pdo, string $table): array
+    {
+        $rows = $pdo->query("PRAGMA main.table_info({$table})")->fetchAll();
+        $keyed = [];
+        foreach ($rows as $row) {
+            $ordinal = (int) $row['pk'];
+            if ($ordinal > 0) {
+                $keyed[$ordinal] = (string) $row['name'];
+            }
+        }
+        ksort($keyed);
+
+        return array_values($keyed);
     }
 
     /** @return list<string> */

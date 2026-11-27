@@ -31,7 +31,8 @@ spl_autoload_register(static function (string $class): void {
 
 require __DIR__ . '/helpers.php';
 
-if (PHP_SAPI !== 'cli' && function_exists('posix_geteuid') && posix_geteuid() === 0) {
+if (PHP_SAPI !== 'cli' && DIRECTORY_SEPARATOR === '/'
+    && (!function_exists('posix_geteuid') || posix_geteuid() === 0)) {
     http_response_code(500);
     header('Content-Type: text/html; charset=UTF-8');
     echo '伺服器設定錯誤：網站服務不得以 root 身分執行，請改用一般使用者（例如 www）後重新啟動。';

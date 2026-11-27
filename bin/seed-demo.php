@@ -200,12 +200,14 @@ try {
         ['BRK-B', 'Berkshire Hathaway', 'US'],
     ];
     $iid = [];
+    $currency = [];
     foreach ($instruments as [$symbol, $name, $market]) {
         $yahoo = Markets::toYahoo($symbol, $market);
+        $currency[$symbol] = Markets::currencyFor($market);
         Database::run(
             'INSERT OR IGNORE INTO instruments (symbol, name, market, yahoo_symbol, currency, asset_class, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [$symbol, $name, $market, $yahoo, Markets::currencyFor($market), 'EQUITY', $now]
+            [$symbol, $name, $market, $yahoo, $currency[$symbol], 'EQUITY', $now]
         );
         $iid[$symbol] = (int) Database::scalar('SELECT id FROM instruments WHERE yahoo_symbol = ?', [$yahoo]);
     }
@@ -232,9 +234,9 @@ try {
 
     foreach ($trades as [$portfolio, $symbol, $side, $date, $qty, $price, $fee, $note]) {
         Database::run(
-            'INSERT INTO transactions (portfolio_id, instrument_id, side, traded_on, quantity, price, fee, note, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [$ids[$portfolio], $iid[$symbol], $side, $date, $qty, $price, $fee, $note, $now]
+            'INSERT INTO transactions (portfolio_id, instrument_id, side, traded_on, currency, quantity, price, fee, note, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [$ids[$portfolio], $iid[$symbol], $side, $date, $currency[$symbol], $qty, $price, $fee, $note, $now]
         );
     }
 

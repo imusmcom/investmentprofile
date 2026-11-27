@@ -509,6 +509,93 @@ final class QuoteService
         return self::fresh(is_string($stamp) ? $stamp : null, $minutes);
     }
 
+    /** @return array{ok:bool, price:?float, as_of:?string, error:?string} */
+    public static function fetchAndWrite(int $instrumentId): array
+    {
+        $lease = self::acquireInstrumentLock($instrumentId);
+        if ($lease['busy']) {
+            return ['ok' => false, 'price' => null, 'as_of' => null, 'error' => '另一項更新正在處理這檔投資物，請稍後再試。'];
+        }
+        try {
+            $instrument = Database::one('SELECT yahoo_symbol FROM instruments WHERE id = ?', [$instrumentId]);
+            if ($instrument === null) {
+                return ['ok' => false, 'price' => null, 'as_of' => null, 'error' => '投資物不存在'];
+            }
+
+            $quote = self::get((string) $instrument['yahoo_symbol']);
+            if (!$quote['ok'] || $quote['price'] === null) {
+                return ['ok' => false, 'price' => null, 'as_of' => null, 'error' => $quote['error'] ?? '查無資料'];
+            }
+
+            $currency = self::writeQuote($instrumentId, $quote);
+            self::refreshFx([$currency]);
+
+            return ['ok' => true, 'price' => $quote['price'], 'as_of' => $quote['as_of'], 'error' => null];
+        } catch (UserError $e) {
+            return ['ok' => false, 'price' => null, 'as_of' => null, 'error' => $e->getMessage()];
+        } finally {
+            self::releaseInstrumentLock($lease['handle']);
+        }
+    }
+
+    /**
+     * Cross-process lease for one instrument's freshness check, network request and writes. A busy
+     * instrument is skipped; an unavailable filesystem lock deliberately fails open to the old behavior.
+     * Lock files stay in place: unlinking one after flock would let another process lock a new inode while
+     * a waiter still holds the old one. The kernel releases the lease on every exit, including crashes.
+     *
+     * @return array{handle:?resource, busy:bool}
+     */
+    private static function acquireInstrumentLock(int $instrumentId): array
+    {
+        $unavailable = ['handle' => null, 'busy' => false];
+        if (!function_exists('flock')) {
+            return $unavailable;
+        }
+        $config = self::config();
+        $dir = rtrim((string) ($config['data_dir'] ?? ''), "/\\");
+        if ($dir === '' || !is_dir($dir) || is_link($dir)) {
+            return $unavailable;
+        }
+        $locks = $dir . '/locks';
+        if (is_link($locks) || (file_exists($locks) && !is_dir($locks))) {
+            return $unavailable;
+        }
+        if (!is_dir($locks) && !@mkdir($locks, 0750) && !is_dir($locks)) {
+            return $unavailable;
+        }
+        $path = $locks . '/quote-' . $instrumentId . '.lock';
+        clearstatcache(true, $path);
+        if (is_link($path)) {
+            return $unavailable;
+        }
+        $handle = @fopen($path, 'c+b');
+        if (!is_resource($handle)) {
+            return $unavailable;
+        }
+        @chmod($path, 0600);
+        if (!@flock($handle, LOCK_EX | LOCK_NB)) {
+            // PHP returns the same false for contention and filesystems that do not implement flock.
+            // LOCK_UN succeeds on an unlocked descriptor but fails on an unsupported filesystem; it
+            // does not release another descriptor's lease. Only genuine contention should be skipped.
+            $supported = @flock($handle, LOCK_UN);
+            fclose($handle);
+
+            return ['handle' => null, 'busy' => $supported];
+        }
+
+        return ['handle' => $handle, 'busy' => false];
+    }
+
+    /** @param resource $handle */
+    private static function releaseInstrumentLock(mixed $handle): void
+    {
+        if (is_resource($handle)) {
+            @flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+    }
+
     /**
      * Timestamps are compared in PHP because they were written by PHP: SQLite's datetime('now') is UTC
      * whatever the app's clock says, which is the same trap the write path already avoids.
@@ -811,7 +898,8 @@ final class QuoteService
                    low = COALESCE(excluded.low, prices.low),
                    prev_close = excluded.prev_close,
                    adj_close = COALESCE(excluded.adj_close, prices.adj_close),
-                   currency = excluded.currency, source = excluded.source, fetched_at = excluded.fetched_at'
+                   currency = excluded.currency, source = excluded.source, fetched_at = excluded.fetched_at
+                 WHERE prices.fetched_at <= excluded.fetched_at'
             );
             $current->execute([
                 'iid' => $instrumentId,
@@ -824,6 +912,13 @@ final class QuoteService
                 'currency' => $currency,
                 'now' => $now,
             ]);
+            // A late response from another worker must not add its older history after a newer quote
+            // has already landed. The conditional upsert above is the final race-safe check.
+            if ($current->rowCount() === 0) {
+                $pdo->commit();
+
+                return $currency;
+            }
 
             if ($incoming !== []) {
                 // Read only dates present in this payload, in bounded chunks. A deep refetch does not
@@ -832,7 +927,7 @@ final class QuoteService
                 foreach (array_chunk(array_keys($incomingDates), 400) as $dates) {
                     $holders = implode(',', array_fill(0, count($dates), '?'));
                     $existing = $pdo->prepare(
-                        "SELECT as_of, close, high, low, adj_close, currency FROM prices
+                        "SELECT as_of, close, high, low, adj_close, currency, fetched_at FROM prices
                          WHERE instrument_id = ? AND as_of IN ($holders)"
                     );
                     $existing->execute([$instrumentId, ...$dates]);
@@ -849,7 +944,8 @@ final class QuoteService
                        high = COALESCE(excluded.high, prices.high),
                        low = COALESCE(excluded.low, prices.low),
                        adj_close = COALESCE(excluded.adj_close, prices.adj_close),
-                       currency = excluded.currency, fetched_at = excluded.fetched_at'
+                       currency = excluded.currency, fetched_at = excluded.fetched_at
+                     WHERE prices.fetched_at <= excluded.fetched_at'
                 );
                 foreach ($incoming as $bar) {
                     $date = $bar['date'];
@@ -858,6 +954,9 @@ final class QuoteService
                     [$high, $low] = [$bar['high'], $bar['low']];
                     $prior = $existingBars[$date] ?? null;
                     if ($prior !== null) {
+                        if (strcmp((string) $prior['fetched_at'], $now) > 0) {
+                            continue;
+                        }
                         $priorAdj = $prior['adj_close'] === null ? null : (float) $prior['adj_close'];
                         $priorHigh = $prior['high'] === null ? null : (float) $prior['high'];
                         $priorLow = $prior['low'] === null ? null : (float) $prior['low'];
@@ -891,6 +990,7 @@ final class QuoteService
                         'low' => $low ?? ($prior['low'] ?? null),
                         'adj_close' => $adj ?? ($prior['adj_close'] ?? null),
                         'currency' => $currency,
+                        'fetched_at' => $now,
                     ];
                 }
             }
@@ -1112,53 +1212,63 @@ final class QuoteService
                 break;
             }
 
-            // 暫停要擋的是「同一檔在幾分鐘內被問兩次」，不是「欠的歷史一直補不進來」：十年深抓還沒成功的
-            // 投資物一定要放行。少了這一句，新建立的標的會先假裝「資料不足」整整一個排程週期，而且
-            // 那一輪的回報裡半個錯誤訊息都不会有（正式區實測過：七檔新 ETF 各只存進 128 根）。
-            if (!self::deepOwed((int) $inst['id'], self::oldestBar((int) $inst['id']))
-                && self::recentlyFetched((int) $inst['id'], $minAge)) {
+            $iid = (int) $inst['id'];
+            $lease = self::acquireInstrumentLock($iid);
+            if ($lease['busy']) {
                 $skipped++;
                 continue;
             }
-
-            if ($asked > 0 && $gap > 0) {
-                $sleep = $gap * 1000;
-                if ($deadline !== null) {
-                    $sleep = min($sleep, max(0, (int) (($deadline - microtime(true) - 2.0) * 1000000)));
-                }
-                if ($sleep > 0) {
-                    usleep($sleep);
-                }
-            }
-            $asked++;
-
-            $quote = self::get((string) $inst['yahoo_symbol'], null, $deadline);
-            if (!$quote['ok']) {
-                $failed++;
-                $errors[] = sprintf('%s（%s）：%s', $inst['symbol'], $inst['yahoo_symbol'], $quote['error']);
-                continue;
-            }
-
             try {
-                $currency = self::writeQuote((int) $inst['id'], $quote);
-            } catch (UserError $e) {
-                $failed++;
-                $errors[] = sprintf('%s（%s）：%s', $inst['symbol'], $inst['yahoo_symbol'], $e->getMessage());
-                continue;
-            }
+                // 暫停要擋的是「同一檔在幾分鐘內被問兩次」，不是「欠的歷史一直補不進來」：十年深抓還沒成功的
+                // 投資物一定要放行。少了這一句，新建立的標的會先假裝「資料不足」整整一個排程週期，而且
+                // 那一輪的回報裡半個錯誤訊息都不会有（正式區實測過：七檔新 ETF 各只存進 128 根）。
+                if (!self::deepOwed($iid, self::oldestBar($iid))
+                    && self::recentlyFetched($iid, $minAge)) {
+                    $skipped++;
+                    continue;
+                }
 
-            $deep = self::syncHistory((int) $inst['id'], (string) $inst['yahoo_symbol'], $deadline);
-            $historyBars += $deep['bars'];
-            if ($deep['error'] !== null) {
-                $historyFailed++;
-                $yahoo = (string) $inst['yahoo_symbol'];
-                $symbol = (string) $inst['symbol'];
-                $deepErrors[(string) $deep['error']][] = $yahoo !== '' && strcasecmp($yahoo, $symbol) !== 0
-                    ? $symbol . '（' . $yahoo . '）'
-                    : $symbol;
-            }
+                if ($asked > 0 && $gap > 0) {
+                    $sleep = $gap * 1000;
+                    if ($deadline !== null) {
+                        $sleep = min($sleep, max(0, (int) (($deadline - microtime(true) - 2.0) * 1000000)));
+                    }
+                    if ($sleep > 0) {
+                        usleep($sleep);
+                    }
+                }
+                $asked++;
 
-            $updated++;
+                $quote = self::get((string) $inst['yahoo_symbol'], null, $deadline);
+                if (!$quote['ok']) {
+                    $failed++;
+                    $errors[] = sprintf('%s（%s）：%s', $inst['symbol'], $inst['yahoo_symbol'], $quote['error']);
+                    continue;
+                }
+
+                try {
+                    $currency = self::writeQuote($iid, $quote);
+                } catch (UserError $e) {
+                    $failed++;
+                    $errors[] = sprintf('%s（%s）：%s', $inst['symbol'], $inst['yahoo_symbol'], $e->getMessage());
+                    continue;
+                }
+
+                $deep = self::syncHistory($iid, (string) $inst['yahoo_symbol'], $deadline);
+                $historyBars += $deep['bars'];
+                if ($deep['error'] !== null) {
+                    $historyFailed++;
+                    $yahoo = (string) $inst['yahoo_symbol'];
+                    $symbol = (string) $inst['symbol'];
+                    $deepErrors[(string) $deep['error']][] = $yahoo !== '' && strcasecmp($yahoo, $symbol) !== 0
+                        ? $symbol . '（' . $yahoo . '）'
+                        : $symbol;
+                }
+
+                $updated++;
+            } finally {
+                self::releaseInstrumentLock($lease['handle']);
+            }
         }
 
         // 同一個原因只講一次：來源整個掛掉時，31 行一模樣的錯誤會把閃訊淹死，

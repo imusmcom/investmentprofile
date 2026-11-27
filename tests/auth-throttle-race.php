@@ -10,7 +10,17 @@ namespace App {
 
     function password_verify(string $password, string $hash): bool
     {
+        if (!empty($GLOBALS['auth_test_rotate_fail'])) {
+            return \password_verify($password, $hash);
+        }
         throw new \RuntimeException('locked caller attempted password verification');
+    }
+
+    function session_regenerate_id(bool $delete_old_session = false): bool
+    {
+        return !empty($GLOBALS['auth_test_rotate_fail'])
+            ? false
+            : \session_regenerate_id($delete_old_session);
     }
 
     function password_needs_rehash(string $hash, string|int $algorithm, array $options = []): bool
@@ -115,6 +125,25 @@ namespace {
         exit(1);
     }
     echo "  ok   locked callers skip global sleep, hashing, and throttle/session changes\n";
+
+    $GLOBALS['auth_test_rotate_fail'] = true;
+    App\Auth::createAccount('admin', 'original-pass-1');
+    $beforeHash = (string) App\Database::scalar('SELECT password_hash FROM access WHERE id = 1');
+    $_SESSION['auth_stamp'] = 'existing-stamp';
+    $rotationError = null;
+    try {
+        App\Auth::changePassword('original-pass-1', 'replacement-pass-2', 'replacement-pass-2');
+    } catch (RuntimeException $e) {
+        $rotationError = $e->getMessage();
+    }
+    $afterHash = (string) App\Database::scalar('SELECT password_hash FROM access WHERE id = 1');
+    if ($rotationError !== '無法更新登入 session，請重新登入後再試。'
+        || $afterHash !== $beforeHash
+        || ($_SESSION['auth_stamp'] ?? '') !== 'existing-stamp') {
+        fwrite(STDERR, "failed session rotation did not fail closed\n");
+        exit(1);
+    }
+    echo "  ok   failed session rotation leaves the password and auth stamp unchanged\n";
 
     echo "AUTH THROTTLE RACE ALL PASS\n";
 }

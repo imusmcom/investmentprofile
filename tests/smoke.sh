@@ -335,6 +335,65 @@ fi
 execq "$DB" "DELETE FROM portfolios WHERE id=$MPID"
 echo "  ok   DB 與 HTTP 讀寫目標雙向一致"
 
+echo "overview: all portfolios is the fresh-session default"
+# Keep this in a separate cookie jar: the suite's working session has explicitly selected $PID and
+# must not be changed by the default-scope checks below.
+DEFAULT_JAR="$WORK/default-scope-cookies.txt"
+rm -f "$DEFAULT_JAR"
+DT=$(curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/login" | grep -o 'name="_csrf" value="[a-f0-9]*"' | head -1 | sed 's/.*value="//;s/"//')
+CODE=$(curl -s -o /dev/null -w "%{http_code}" -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" -X POST "$BASE/login" \
+    -d "_csrf=$DT" -d "username=$ADMIN" -d "password=$PASS")
+[ "$CODE" = "303" ] && echo "  ok   a fresh session signs in for the default-scope checks" \
+    || { echo "  FAIL default-scope login gave $CODE"; FAIL=1; }
+DEFAULT_COUNT=$(q "SELECT COUNT(*) FROM portfolios")
+curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/" > "$WORK/default-all.html"
+check "a fresh session starts with all portfolios selected" '<option value="all" selected' "$WORK/default-all.html"
+check "the aggregate heading counts every portfolio" "所有組合合計（$DEFAULT_COUNT 個）" "$WORK/default-all.html"
+curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/portfolios" > "$WORK/default-portfolios.html"
+check "the portfolio page names the aggregate scope" "總覽範圍：所有組合" "$WORK/default-portfolios.html"
+notcheck "aggregate mode does not mark one portfolio active" "使用中" "$WORK/default-portfolios.html"
+
+execq "$DB" "INSERT INTO portfolios (name, description) VALUES ('HSBC','預設範圍測試')"
+HPID=$(q "SELECT id FROM portfolios WHERE name='HSBC'")
+curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/" > "$WORK/default-with-hsbc.html"
+check "adding HSBC does not replace the all-portfolios default" '<option value="all" selected' "$WORK/default-with-hsbc.html"
+
+DT=$(curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/" | grep -o 'name="_csrf" value="[a-f0-9]*"' | head -1 | sed 's/.*value="//;s/"//')
+curl -s -o /dev/null -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" -X POST "$BASE/scope" \
+    -d "_csrf=$DT" -d "scope=$PID"
+curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/" > "$WORK/default-explicit.html"
+check "an explicit single-portfolio choice is honoured" "value=\"$PID\" selected" "$WORK/default-explicit.html"
+notcheck "the single portfolio is not shown as an aggregate" '<option value="all" selected' "$WORK/default-explicit.html"
+curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/portfolios" > "$WORK/default-single-portfolios.html"
+check "single-portfolio mode marks one portfolio active" "使用中" "$WORK/default-single-portfolios.html"
+notcheck "single-portfolio mode does not claim aggregate scope" "總覽範圍：所有組合" "$WORK/default-single-portfolios.html"
+
+DT=$(curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/" | grep -o 'name="_csrf" value="[a-f0-9]*"' | head -1 | sed 's/.*value="//;s/"//')
+curl -s -o /dev/null -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" -X POST "$BASE/scope" \
+    -d "_csrf=$DT" -d "scope=all"
+curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/" > "$WORK/default-explicit-all.html"
+check "switching back to all portfolios is remembered" '<option value="all" selected' "$WORK/default-explicit-all.html"
+
+SCOPE_STATE=$(PORTFOLIO_DATA_DIR="$DATADIR" "$PHPBIN" -d display_errors=stderr -r '
+require $argv[1];
+$method = new ReflectionMethod(App\Handlers::class, "dashboardScope");
+$method->setAccessible(true);
+$_SESSION = [];
+$defaultAggregate = $method->invoke(null);
+$_SESSION = ["dashboard_scope" => "all", "portfolio_id" => 123];
+$legacyAggregate = $method->invoke(null);
+$_SESSION = ["portfolio_id" => 123];
+$singleAggregate = $method->invoke(null);
+echo "default=" . (int) $defaultAggregate . ";legacy=" . (int) $legacyAggregate . ";single=" . (int) $singleAggregate;
+' "$ROOT/app/bootstrap.php")
+[ "$SCOPE_STATE" = "default=1;legacy=1;single=0" ] \
+    && echo "  ok   aggregate is the default and a single portfolio remains an explicit override" \
+    || { echo "  FAIL aggregate default state: $SCOPE_STATE"; FAIL=1; }
+
+execq "$DB" "DELETE FROM portfolios WHERE id=$HPID"
+curl -s -c "$DEFAULT_JAR" -b "$DEFAULT_JAR" "$BASE/" > "$WORK/default-after-delete.html"
+check "the explicit all-portfolios choice survives deleting HSBC" '<option value="all" selected' "$WORK/default-after-delete.html"
+
 echo "local quote source（在所有報價與匯率操作前啟動）"
 ORIG_QUOTE_ENDPOINT="$(q "SELECT value FROM settings WHERE key='quote_endpoint'")"
 ORIG_QUOTE_TOKEN="$(q "SELECT value FROM settings WHERE key='quote_token'")"
@@ -372,9 +431,43 @@ post "/settings" "$T" -d "base_currency=$BC" -d "quote_source=yahoo" \
     -d "quote_endpoint=$STUB_ENDPOINT" -d "quote_token=visual-secret" -d "quote_refresh_budget=240" >/dev/null
 get "/settings" "$WORK/quote-token.html" >/dev/null
 checkf "轉接金鑰使用密碼欄位遮罩" 'type="password" name="quote_token"' "$WORK/quote-token.html"
+notcheckf "settings HTML never renders the stored quote token" 'visual-secret' "$WORK/quote-token.html"
+TOKEN_FIELD=$(grep 'name="quote_token"' "$WORK/quote-token.html")
+case "$TOKEN_FIELD" in
+    *value=*) echo "  FAIL quote token input still has a value attribute"; FAIL=1 ;;
+    *) echo "  ok   quote token input is blank" ;;
+esac
+checkf "blank token is documented as preserve" '留空＝保留目前的金鑰' "$WORK/quote-token.html"
+checkf "clearing a token has an explicit checkbox" 'name="clear_quote_token" value="1"' "$WORK/quote-token.html"
 T=$(csrf "/settings")
 post "/settings" "$T" -d "base_currency=$BC" -d "quote_source=yahoo" \
     -d "quote_endpoint=$STUB_ENDPOINT" -d "quote_token=" -d "quote_refresh_budget=240" >/dev/null
+[ "$(q "SELECT value FROM settings WHERE key='quote_token'")" = "visual-secret" ] \
+    && echo "  ok   a blank token submission preserves the stored key" \
+    || { echo "  FAIL blank token submission erased the key"; FAIL=1; }
+T=$(csrf "/settings")
+post "/settings" "$T" -d "base_currency=$BC" -d "quote_source=yahoo" \
+    -d "quote_endpoint=$STUB_ENDPOINT" -d "quote_token=" -d "clear_quote_token=yes" -d "quote_refresh_budget=240" >/dev/null
+check "a malformed clear flag is refused" "清除報價金鑰的選項不正確" "$LAST"
+[ "$(q "SELECT value FROM settings WHERE key='quote_token'")" = "visual-secret" ] \
+    && echo "  ok   a refused clear leaves the token unchanged" \
+    || { echo "  FAIL a refused clear changed the token"; FAIL=1; }
+T=$(csrf "/settings")
+post "/settings" "$T" -d "base_currency=$BC" -d "quote_source=yahoo" \
+    -d "quote_endpoint=$STUB_ENDPOINT" -d "quote_token=replacement" -d "clear_quote_token=1" -d "quote_refresh_budget=240" >/dev/null
+check "clear and replacement together are refused" "不要同時填寫新的金鑰" "$LAST"
+[ "$(q "SELECT value FROM settings WHERE key='quote_token'")" = "visual-secret" ] \
+    && echo "  ok   an ambiguous clear leaves the token unchanged" \
+    || { echo "  FAIL an ambiguous clear changed the token"; FAIL=1; }
+T=$(csrf "/settings")
+post "/settings" "$T" -d "base_currency=$BC" -d "quote_source=yahoo" \
+    -d "quote_endpoint=$STUB_ENDPOINT" -d "quote_token=" -d "clear_quote_token=1" -d "quote_refresh_budget=240" >/dev/null
+[ -z "$(q "SELECT value FROM settings WHERE key='quote_token'")" ] \
+    && echo "  ok   the explicit clear flag empties the token" \
+    || { echo "  FAIL explicit clear did not empty the token"; FAIL=1; }
+T=$(csrf "/settings")
+post "/settings" "$T" -d "base_currency=$BC" -d "quote_source=yahoo" \
+    -d "quote_endpoint=$STUB_ENDPOINT" -d "quote_token=visual-secret" -d "quote_refresh_budget=240" >/dev/null
 for bad in 4 601 5.5 abc; do
     T=$(csrf "/settings")
     post "/settings" "$T" -d "base_currency=$BC" -d "quote_source=yahoo" \
@@ -462,6 +555,14 @@ NTX=$(q "SELECT COUNT(*) FROM transactions WHERE instrument_id=$AID AND side='BU
 [ "$NTX" = "2" ] && echo "  ok   both AAPL buys stored" || { echo "  FAIL expected 2 buys, got '$NTX'"; FAIL=1; }
 post "/transactions" "$T" -d "portfolio_id=$PID" -d "side=SELL" -d "traded_on=2025-03-04" \
   -d "quantity=50" -d "price=200" -d "fee=5" -d "instrument_id=$AID" >/dev/null
+TX_CURRENCIES=$(q "SELECT group_concat(DISTINCT currency) FROM transactions WHERE instrument_id=$AID")
+[ "$TX_CURRENCIES" = "USD" ] && echo "  ok   每筆交易保存成交幣別" \
+  || { echo "  FAIL 交易幣別未保存：$TX_CURRENCIES"; FAIL=1; }
+execq "$DB" "UPDATE instruments SET currency='EUR' WHERE id=$AID"
+get "/export?instrument=$AID" "$WORK/historical-currency.csv" >/dev/null
+check "CSV 使用交易當時的幣別，不被投資物目前幣別改寫" ",USD," "$WORK/historical-currency.csv"
+notcheck "CSV 不把歷史交易誤標成目前 EUR" ",EUR," "$WORK/historical-currency.csv"
+execq "$DB" "UPDATE instruments SET currency='USD' WHERE id=$AID"
 
 echo "guards and validation"
 post "/transactions" "$T" -d "portfolio_id=$PID" -d "side=SELL" -d "traded_on=2025-04-05" \
@@ -1288,8 +1389,8 @@ echo
 echo "回報：期間與年度表現"
 # A portfolio of its own with two hand-written bars, so every percentage below is checkable by hand:
 # 10 shares bought at 100 on 2025-01-02 against a 2,000 deposit, and the price is 150 on 2025-06-02.
-# 持股 therefore gains 50% (1,000 -> 1,500) while 持股＋現金 gains 25% (2,000 -> 2,500): the idle 1,000
-# of cash is in the second column's denominator and earns nothing, which is the point of listing both.
+# 持股 therefore gains 50% (1,000 -> 1,500), 現金 stays at 0% (1,000 -> 1,000), while 持股＋現金 gains
+# 25% (2,000 -> 2,500): the idle 1,000 of cash is in the total column's denominator and earns nothing.
 T=$(csrf "/reports")
 post "/portfolios" "$T" -d "name=回報測試" -d "description=" >/dev/null
 RPID=$(q "SELECT id FROM portfolios WHERE name='回報測試'")
@@ -1324,9 +1425,20 @@ check "持股 gains 50.00%" ">+50\.00%<" "$WORK/reports.html"
 check "持股＋現金 gains only 25.00%" ">+25\.00%<" "$WORK/reports.html"
 check "a window longer than the history says so" "歷史還不夠長" "$WORK/reports.html"
 check "the yearly table is there" ">每年度表現<" "$WORK/reports.html"
+YEAR_HEADER=$(sed -n '/<h3>每年度表現<\/h3>/,/<\/thead>/p' "$WORK/reports.html" | sed 's/<[^>]*>/ /g' | tr -s '[:space:]' ' ')
+[[ "$YEAR_HEADER" == *"年度 起點 期末 持股 現金 持股＋現金"* ]] \
+  && echo "  ok   yearly columns are 持股、現金、持股＋現金" \
+  || { echo "  FAIL yearly column order: $YEAR_HEADER"; FAIL=1; }
+YEAR_ROW=$(sed -n '/<strong>2025<\/strong>/,/<\/tr>/p' "$WORK/reports.html" | sed 's/<[^>]*>//g' | tr -s '[:space:]' ' ')
+[[ "$YEAR_ROW" == *"2025 2025-01-02 2025-06-02 +50.00% 0.00% +25.00%"* ]] \
+  && echo "  ok   yearly row shows holdings, idle cash, then total" \
+  || { echo "  FAIL yearly row values: $YEAR_ROW"; FAIL=1; }
 check "2025 gets a yearly row" ">2025<" "$WORK/reports.html"
 check "the running year is marked" "年度尚未結束" "$WORK/reports.html"
 check "the method is explained" ">怎麼算<" "$WORK/reports.html"
+check "cash deposits and withdrawals count as return" "存入視為正報酬、提取視為負報酬" "$WORK/reports.html"
+check "total includes principal changes" "存入／提取全額計入" "$WORK/reports.html"
+check "total only needs complete endpoints" "只需期初與期末可計價" "$WORK/reports.html"
 check "constant-rate FX is disclosed" "固定匯率" "$WORK/reports.html"
 check "更新報價 stays on the report page" 'name="back" value="/reports"' "$WORK/reports.html"
 
@@ -1983,10 +2095,19 @@ check "re-using the password you already have is refused" "新密碼不能跟現
   && echo "  ok   none of those four touched the stored hash" \
   || { echo "  FAIL a refused password change wrote the hash anyway"; FAIL=1; }
 
+OLD_PASSWORD_SESSION=$(grep portfolio_session "$JAR" | awk '{print $7}' | tail -1)
 CODE=$(post "/password" "$T" -d "current_password=$PASS" -d "new_password=$NEWPASS" -d "new_password2=$NEWPASS")
 [ "$CODE" = "200" ] && check "the change is confirmed on the settings page" "密碼已更新" "$LAST"
+NEW_PASSWORD_SESSION=$(grep portfolio_session "$JAR" | awk '{print $7}' | tail -1)
+[ -n "$OLD_PASSWORD_SESSION" ] && [ "$NEW_PASSWORD_SESSION" != "$OLD_PASSWORD_SESSION" ] \
+    && echo "  ok   a successful password change rotates the session id" \
+    || { echo "  FAIL password change did not rotate the session id"; FAIL=1; }
 NEWHASH=$(q "SELECT password_hash FROM access WHERE id = 1")
 [ "$NEWHASH" != "$BEFORE_HASH" ] && echo "  ok   the stored hash really changed" || { echo "  FAIL hash unchanged"; FAIL=1; }
+CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "portfolio_session=$OLD_PASSWORD_SESSION" "$BASE/holdings")
+[ "$CODE" = "303" ] \
+    && echo "  ok   a copied pre-change cookie is invalid after the password change" \
+    || { echo "  FAIL the copied old cookie survived ($CODE)"; FAIL=1; }
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$AJAR" "$BASE/holdings")
 [ "$CODE" = "303" ] \
   && echo "  ok   the other browser is thrown out the moment the password changes" \
@@ -2050,11 +2171,12 @@ else
     && echo "  ok   and the refused value was not written" \
     || { echo "  FAIL the bad address got stored"; FAIL=1; }
 
+  TOKEN_BEFORE_REJECT=$(q "SELECT value FROM settings WHERE key = 'quote_token'")
   T=$(csrf "/settings")
   post "/settings" "$T" -d "base_currency=$BC" -d "quote_endpoint=http://proxy.example.com" -d "quote_token=sekret" -d "quote_refresh_budget=240" >/dev/null
   check "a token refuses to travel over plain HTTP" "已設定報價金鑰時，轉接位址必須使用 HTTPS" "$LAST"
   [ "$(q "SELECT value FROM settings WHERE key = 'quote_endpoint'")" = "$STUB_ENDPOINT" ] \
-    && [ -z "$(q "SELECT value FROM settings WHERE key = 'quote_token'")" ] \
+    && [ "$(q "SELECT value FROM settings WHERE key = 'quote_token'")" = "$TOKEN_BEFORE_REJECT" ] \
     && echo "  ok   the rejected endpoint and token were both left unchanged" \
     || { echo "  FAIL the insecure token settings were written"; FAIL=1; }
 
@@ -2316,7 +2438,7 @@ else
     DELETE FROM settings WHERE substr(key,1,12) = 'deep_oldest_';"
 
   T=$(csrf "/settings")
-  post "/settings" "$T" -d "base_currency=$BC" -d "quote_source=yahoo" -d "quote_endpoint=" -d "quote_token=" -d "quote_refresh_budget=240" >/dev/null
+  post "/settings" "$T" -d "base_currency=$BC" -d "quote_source=yahoo" -d "quote_endpoint=" -d "quote_token=" -d "clear_quote_token=1" -d "quote_refresh_budget=240" >/dev/null
   [ -z "$(q "SELECT value FROM settings WHERE key = 'quote_endpoint'")" ] \
     && [ -z "$(q "SELECT value FROM settings WHERE key = 'quote_token'")" ] \
     && echo "  ok   clearing the address goes back to Yahoo itself" \
@@ -2494,9 +2616,9 @@ AFTER="$(q "SELECT (SELECT COUNT(*) FROM instruments)||'/'||(SELECT COUNT(*) FRO
 [ "$(q "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'lab_%'")" = "0" ] \
   && echo "  ok   移除實驗功能後資料庫沒有 lab_* 資料表" \
   || { echo "  FAIL a lab_ table survived"; FAIL=1; }
-[ "$(q "SELECT value FROM settings WHERE key='schema_version'")" = "8" ] \
-  && echo "  ok   資料庫已遷移到 schema v8" \
-  || { echo "  FAIL schema version is not 8"; FAIL=1; }
+[ "$(q "SELECT value FROM settings WHERE key='schema_version'")" = "9" ] \
+  && echo "  ok   資料庫已遷移到 schema v9" \
+  || { echo "  FAIL schema version is not 9"; FAIL=1; }
 
 execq "$DB" "DELETE FROM prices WHERE instrument_id IN (SELECT id FROM instruments WHERE yahoo_symbol = 'LHFT');
   DELETE FROM instruments WHERE yahoo_symbol = 'LHFT';"

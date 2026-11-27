@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS transactions (
         AND date(traded_on) IS NOT NULL
         AND date(traded_on) = traded_on
     ),
+    currency     TEXT NOT NULL DEFAULT '' CHECK (currency = '' OR length(currency) BETWEEN 2 AND 5),
     quantity     REAL NOT NULL CHECK (quantity > 0),
     price        REAL NOT NULL CHECK (price >= 0),
     fee          REAL NOT NULL DEFAULT 0 CHECK (fee >= 0),

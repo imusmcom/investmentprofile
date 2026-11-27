@@ -117,7 +117,7 @@ final class Database
 
     private static function migrate(PDO $pdo): void
     {
-        $targetVersion = 8;
+        $targetVersion = 9;
         $settingsExisted = (int) self::scalar(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'",
             [],
@@ -166,9 +166,20 @@ final class Database
                 self::normalisePriceRanges($pdo);
                 self::cleanInvalidPrices($pdo);
 
-                // v8 reconciles existing tables with the declared schema. A correct composite primary key
-                // alone does not prove the older table gained the date, positivity, currency, or source CHECKs.
+                // v8 reconciles existing tables with the declared schema. v9 also snapshots each trade's
+                // currency, so changing an instrument later cannot reinterpret historical settlement cash.
                 self::rebuildPrices($pdo);
+                self::addColumn(
+                    $pdo,
+                    'transactions',
+                    'currency',
+                    "TEXT NOT NULL DEFAULT '' CHECK (currency = '' OR length(currency) BETWEEN 2 AND 5)"
+                );
+                $pdo->exec("UPDATE transactions
+                            SET currency = upper(trim(i.currency))
+                            FROM instruments i
+                            WHERE i.id = transactions.instrument_id
+                              AND transactions.currency = ''");
                 self::rebuildTransactions($pdo);
                 self::rebuildCashMovements($pdo);
             }
@@ -298,7 +309,7 @@ final class Database
             OR date(traded_on) IS NULL OR date(traded_on) <> traded_on";
         $bad = (int) self::scalar('SELECT COUNT(*) FROM transactions WHERE ' . $invalid, [], 0);
         if ($bad > 0) {
-            throw new RuntimeException("資料庫遷移：{$bad} 筆交易日期不正確，已取消 v8 遷移。");
+            throw new RuntimeException("資料庫遷移：{$bad} 筆交易日期不正確，已取消 v9 遷移。");
         }
 
         $pdo->exec('DROP TABLE IF EXISTS transactions_new');
@@ -313,6 +324,7 @@ final class Database
                 AND date(traded_on) IS NOT NULL
                 AND date(traded_on) = traded_on
             ),
+            currency     TEXT NOT NULL DEFAULT \'\' CHECK (currency = \'\' OR length(currency) BETWEEN 2 AND 5),
             quantity     REAL NOT NULL CHECK (quantity > 0),
             price        REAL NOT NULL CHECK (price >= 0),
             fee          REAL NOT NULL DEFAULT 0 CHECK (fee >= 0),
@@ -320,8 +332,8 @@ final class Database
             created_at   TEXT NOT NULL DEFAULT (datetime(\'now\',\'+8 hours\'))
         )');
         $pdo->exec('INSERT INTO transactions_new
-                    (id, portfolio_id, instrument_id, side, traded_on, quantity, price, fee, note, created_at)
-                    SELECT id, portfolio_id, instrument_id, side, traded_on, quantity, price, fee, note, created_at
+                    (id, portfolio_id, instrument_id, side, traded_on, currency, quantity, price, fee, note, created_at)
+                    SELECT id, portfolio_id, instrument_id, side, traded_on, currency, quantity, price, fee, note, created_at
                     FROM transactions');
         $pdo->exec('DROP TABLE transactions');
         $pdo->exec('ALTER TABLE transactions_new RENAME TO transactions');
@@ -334,7 +346,7 @@ final class Database
             OR date(moved_on) IS NULL OR date(moved_on) <> moved_on";
         $bad = (int) self::scalar('SELECT COUNT(*) FROM cash_movements WHERE ' . $invalid, [], 0);
         if ($bad > 0) {
-            throw new RuntimeException("資料庫遷移：{$bad} 筆現金日期不正確，已取消 v8 遷移。");
+            throw new RuntimeException("資料庫遷移：{$bad} 筆現金日期不正確，已取消 v9 遷移。");
         }
 
         $pdo->exec('DROP TABLE IF EXISTS cash_movements_new');

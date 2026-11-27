@@ -194,16 +194,26 @@ final class Positions
                 'oversold'   => 0,
                 'cash_in'    => 0.0,
                 'cash_out'   => 0.0,
+                // Settlement legs stay in the currency recorded on each trade. The scalar cash fields
+                // above remain the raw accounting totals used by the weighted-average replay.
+                'cash_in_by_currency'  => [],
+                'cash_out_by_currency' => [],
+                'cost_by_currency'      => [],
+                'proceeds_by_currency'  => [],
+                'realized_cost_by_currency' => [],
                 'pids'       => [$pid],
             ];
         }
 
         $txs = Database::all(
-            'SELECT t.*, i.symbol, i.name, i.market, i.currency, i.asset_class
+            "SELECT t.id, t.portfolio_id, t.instrument_id, t.side, t.traded_on,
+                    COALESCE(NULLIF(t.currency, ''), i.currency) AS currency,
+                    t.quantity, t.price, t.fee, t.note, t.created_at,
+                    i.symbol, i.name, i.market, i.currency AS instrument_currency, i.asset_class
              FROM transactions t
              JOIN instruments i ON i.id = t.instrument_id
-             WHERE t.portfolio_id IN (' . $holders . ')
-             ORDER BY t.portfolio_id, t.traded_on ASC, t.id ASC',
+             WHERE t.portfolio_id IN ($holders)
+             ORDER BY t.portfolio_id, t.traded_on ASC, t.id ASC",
             $portfolioIds
         );
 
@@ -219,6 +229,7 @@ final class Positions
             $qty = (float) $t['quantity'];
             $price = (float) $t['price'];
             $fee = (float) $t['fee'];
+            $currency = strtoupper(trim((string) $t['currency']));
 
             $pos['fees'] += $fee;
             $pos['first_on'] ??= $t['traded_on'];
@@ -227,8 +238,11 @@ final class Positions
             if ($t['side'] === 'BUY') {
                 $pos['buy_count']++;
                 $newQty = $pos['qty'] + $qty;
-                $pos['cost_pool'] += $qty * $price + $fee;
-                $pos['cash_out'] += $qty * $price + $fee;
+                $cost = $qty * $price + $fee;
+                $pos['cost_pool'] += $cost;
+                $pos['cash_out'] += $cost;
+                $pos['cost_by_currency'][$currency] = ($pos['cost_by_currency'][$currency] ?? 0.0) + $cost;
+                $pos['cash_out_by_currency'][$currency] = ($pos['cash_out_by_currency'][$currency] ?? 0.0) + $cost;
                 $pos['qty'] = $newQty;
                 $pos['avg'] = $newQty > 0.0 ? $pos['cost_pool'] / $newQty : 0.0;
             } else {
@@ -241,14 +255,32 @@ final class Positions
                 // The cash leg follows $closing, not $qty: whatever was sold beyond the holding never
                 // existed to be sold, and booking its proceeds would raise the total value out of nothing.
                 $pos['cash_in'] += $proceeds;
+                $pos['cash_in_by_currency'][$currency] = ($pos['cash_in_by_currency'][$currency] ?? 0.0) + $proceeds;
+                $pos['proceeds_by_currency'][$currency] = ($pos['proceeds_by_currency'][$currency] ?? 0.0) + $proceeds;
                 $removed = $closing * $pos['avg'];
                 $pos['realized'] += $proceeds - $removed;
+                // Allocate the removed average cost proportionally across its recorded currencies. This
+                // leaves the raw weighted-average replay unchanged while keeping base-currency gains and
+                // remaining cost correct when an instrument's settlement currency changed historically.
+                $costBeforeSale = $pos['cost_pool'];
+                if ($costBeforeSale > 0.0) {
+                    foreach ($pos['cost_by_currency'] as $costCurrency => $costAmount) {
+                        $share = $costAmount / $costBeforeSale;
+                        $removedHere = $removed * $share;
+                        $pos['cost_by_currency'][$costCurrency] = $costAmount - $removedHere;
+                        $pos['realized_cost_by_currency'][$costCurrency] =
+                            ($pos['realized_cost_by_currency'][$costCurrency] ?? 0.0) + $removedHere;
+                    }
+                }
                 $pos['cost_pool'] -= $removed;
                 $pos['qty'] -= $closing;
                 if ($pos['qty'] <= 0.0) {
                     $pos['qty'] = 0.0;
                     $pos['cost_pool'] = 0.0;
                     $pos['avg'] = 0.0;
+                    foreach ($pos['cost_by_currency'] as $costCurrency => $_) {
+                        $pos['cost_by_currency'][$costCurrency] = 0.0;
+                    }
                 } else {
                     $pos['avg'] = $pos['cost_pool'] / $pos['qty'];
                 }
@@ -289,6 +321,13 @@ final class Positions
                 $merged[$id]['fees'] += $pos['fees'];
                 $merged[$id]['cash_in'] += $pos['cash_in'];
                 $merged[$id]['cash_out'] += $pos['cash_out'];
+                foreach (['cash_in_by_currency', 'cash_out_by_currency', 'cost_by_currency',
+                    'proceeds_by_currency', 'realized_cost_by_currency'] as $field) {
+                    foreach ($pos[$field] as $currency => $amount) {
+                        $merged[$id][$field][$currency] =
+                            ($merged[$id][$field][$currency] ?? 0.0) + (float) $amount;
+                    }
+                }
                 $merged[$id]['buy_count'] += $pos['buy_count'];
                 $merged[$id]['sell_count'] += $pos['sell_count'];
                 $merged[$id]['oversold'] += $pos['oversold'];
@@ -310,6 +349,12 @@ final class Positions
         foreach (['qty', 'cost_pool', 'avg', 'realized', 'fees', 'cash_in', 'cash_out'] as $field) {
             self::finite((float) $pos[$field], '持股數量、成本或現金');
         }
+        foreach (['cash_in_by_currency', 'cash_out_by_currency', 'cost_by_currency',
+            'proceeds_by_currency', 'realized_cost_by_currency'] as $field) {
+            foreach ($pos[$field] as $amount) {
+                self::finite((float) $amount, '持股數量、成本或現金');
+            }
+        }
     }
 
     private static function finite(float $value, string $label): float
@@ -319,6 +364,46 @@ final class Positions
         }
 
         return $value;
+    }
+
+    /**
+     * Convert independently recorded currency legs without netting away a missing exchange rate.
+     *
+     * @param array<string,float> $components
+     * @param array<string,bool> $missingFx
+     * @return array{value:?float, converted:bool, dropped:bool}
+     */
+    private static function convertComponents(
+        array $components,
+        string $target,
+        ?array &$fxCache,
+        array &$missingFx
+    ): array {
+        if ($components === []) {
+            return ['value' => 0.0, 'converted' => true, 'dropped' => false];
+        }
+        $total = 0.0;
+        $converted = true;
+        $dropped = false;
+        foreach ($components as $currency => $amount) {
+            $currency = strtoupper(trim((string) $currency));
+            $amount = (float) $amount;
+            if ($amount === 0.0) {
+                continue;
+            }
+            $conv = convert($amount, $currency, $target, $fxCache);
+            if (!$conv['converted']) {
+                $converted = false;
+                if ($amount !== 0.0) {
+                    $dropped = true;
+                    $missingFx[$currency] = true;
+                }
+            } else {
+                $total = self::finite($total + (float) $conv['value'], '換算金額');
+            }
+        }
+
+        return ['value' => $converted ? $total : null, 'converted' => $converted, 'dropped' => $dropped];
     }
 
     /**
@@ -340,8 +425,13 @@ final class Positions
 
         foreach ($book as $id => $p) {
             $inst = $p['instrument'];
-            $native = strtoupper((string) $inst['currency']);
             $quote = $prices[$id] ?? null;
+            // A price row is authoritative for valuation currency. Manual-only prices have no price row,
+            // so they retain the instrument's currency; neither path rewrites historical trade currency.
+            $native = strtoupper(trim((string) ($quote['currency'] ?? '')));
+            if ($native === '' || ($quote['source'] ?? null) === 'manual') {
+                $native = strtoupper(trim((string) $inst['currency']));
+            }
 
             // Fully closed positions still carry realised P&L, so keep them if anything happened. A sell
             // that found nothing to close is the only trace an oversold record leaves: its proceeds are
@@ -351,27 +441,51 @@ final class Positions
                 continue;
             }
 
-            $costBasis = $p['qty'] * $p['avg'];
+            $recordedCostBasis = $p['qty'] * $p['avg'];
+            $costInNative = self::convertComponents($p['cost_by_currency'], $native, $fxCache, $missingFx);
+            $costBasis = $costInNative['value'];
+            $avgCost = $p['qty'] <= 0.0 ? 0.0 : ($costBasis === null ? null : $costBasis / $p['qty']);
             $effective = self::effectivePrice($inst, $quote);
             $lastPrice = $effective['price'] ?? null;
             $marketValue = $lastPrice === null ? null : $p['qty'] * $lastPrice;
-            $unrealized = $marketValue === null ? null : $marketValue - $costBasis;
+            $unrealized = $marketValue === null || $costBasis === null ? null : $marketValue - $costBasis;
+            $proceedsInNative = self::convertComponents(
+                $p['proceeds_by_currency'],
+                $native,
+                $fxCache,
+                $missingFx
+            );
+            $realizedCostInNative = self::convertComponents(
+                $p['realized_cost_by_currency'],
+                $native,
+                $fxCache,
+                $missingFx
+            );
+            $realized = $proceedsInNative['value'] === null || $realizedCostInNative['value'] === null
+                ? null
+                : $proceedsInNative['value'] - $realizedCostInNative['value'];
             // 已出清的持股未實現恆為 0，所以它的合計損益就是已實現。還握在手裡卻拿不到報價時，
             // 合計損益無從得知：把未實現當成 0 加進去，等於宣稱這筆持股一文不值。
             $unrealForGain = $unrealized ?? ($p['qty'] <= 0.0 ? 0.0 : null);
-            $totalGain = $unrealForGain === null ? null : $unrealForGain + $p['realized'];
-            self::finite($costBasis, '持股成本');
+            $totalGain = $unrealForGain === null || $realized === null ? null : $unrealForGain + $realized;
+            self::finite($recordedCostBasis, '持股成本');
+            if ($costBasis !== null) {
+                self::finite($costBasis, '持股成本');
+            }
             if ($marketValue !== null) {
                 self::finite($marketValue, '持股市值');
             }
             if ($unrealized !== null) {
                 self::finite($unrealized, '未實現損益');
             }
+            if ($realized !== null) {
+                self::finite($realized, '已實現損益');
+            }
             if ($totalGain !== null) {
                 self::finite($totalGain, '合計損益');
             }
 
-            $unrealizedPct = $costBasis > 0.0 && $unrealized !== null
+            $unrealizedPct = $costBasis !== null && $costBasis > 0.0 && $unrealized !== null
                 ? $unrealized / $costBasis * 100.0
                 : null;
             if ($unrealizedPct !== null) {
@@ -382,9 +496,14 @@ final class Positions
                 'id'            => $id,
                 'instrument'    => $inst,
                 'native'        => $native,
+                'valuation_currency' => $native,
                 'qty'           => $p['qty'],
-                'avg_cost'      => $p['avg'],
+                'avg_cost'      => $avgCost,
                 'cost_basis'    => $costBasis,
+                // Keep the recorded amounts available for auditing a currency change without confusing
+                // them with the valuation-currency amounts displayed by the existing position table.
+                'recorded_avg_cost' => $p['avg'],
+                'recorded_cost_basis' => $recordedCostBasis,
                 'last_price'    => $lastPrice,
                 'price_source'  => $lastPrice === null ? null : ($quote['source'] ?? null),
                 'price_as_of'   => $effective['as_of'] ?? null,
@@ -392,7 +511,8 @@ final class Positions
                 'market_value'  => $marketValue,
                 'unrealized'    => $unrealized,
                 'unrealized_pct' => $unrealizedPct,
-                'realized'      => $p['realized'],
+                'realized'      => $realized,
+                'recorded_realized' => $p['realized'],
                 'total_gain'    => $p['buy_count'] > 0 || $p['sell_count'] > 0 ? $totalGain : null,
                 'fees'          => $p['fees'],
                 'buy_count'     => $p['buy_count'],
@@ -404,14 +524,21 @@ final class Positions
                 'portfolio_count' => max(1, count($p['pids'])),
             ];
 
-            if ($native !== '') {
-                $currencies[$native] = true;
+            $currencies[$native] = true;
+            foreach (['cost_by_currency', 'proceeds_by_currency', 'realized_cost_by_currency'] as $field) {
+                foreach ($p[$field] as $currency => $amount) {
+                    if ((float) $amount !== 0.0) {
+                        $currencies[strtoupper(trim((string) $currency))] = true;
+                    }
+                }
             }
             if ($lastPrice === null && $row['is_open']) {
                 $missingPrice[] = (string) $inst['symbol'];
             }
 
-            $conv = convert((float) ($marketValue ?? 0.0), $native, $base, $fxCache);
+            $conv = $marketValue === 0.0
+                ? ['value' => 0.0, 'converted' => true]
+                : convert((float) ($marketValue ?? 0.0), $native, $base, $fxCache);
             $row['base_market_value'] = $marketValue === null ? null : $conv['value'];
             $row['base_ok'] = $conv['converted'];
             if (!$conv['converted'] && $marketValue !== null) {
@@ -469,20 +596,36 @@ final class Positions
                     $byCurrency[$cur]['base_market_value'] += (float) $row['base_market_value'];
                 }
             }
-            $costInBase = convert((float) $row['cost_basis'], $row['native'], $base, $fxCache);
-            $unrInBase = $row['unrealized'] === null
+            $position = $book[(int) $row['id']];
+            $costInBase = self::convertComponents($position['cost_by_currency'], $base, $fxCache, $missingFx);
+            $proceedsInBase = self::convertComponents(
+                $position['proceeds_by_currency'],
+                $base,
+                $fxCache,
+                $missingFx
+            );
+            $realizedCostInBase = self::convertComponents(
+                $position['realized_cost_by_currency'],
+                $base,
+                $fxCache,
+                $missingFx
+            );
+            $realInBase = $proceedsInBase['value'] === null || $realizedCostInBase['value'] === null
+                ? ['value' => null, 'converted' => false, 'dropped' => $proceedsInBase['dropped'] || $realizedCostInBase['dropped']]
+                : ['value' => $proceedsInBase['value'] - $realizedCostInBase['value'],
+                    'converted' => true,
+                    'dropped' => false];
+            $marketInBase = $row['market_value'] === null
                 ? ['value' => null, 'converted' => true]
-                : convert((float) $row['unrealized'], $row['native'], $base, $fxCache);
-            $realInBase = convert((float) $row['realized'], $row['native'], $base, $fxCache);
+                : ['value' => $row['base_market_value'], 'converted' => $row['base_market_value'] !== null];
+            $unrInBase = $marketInBase['value'] === null || $costInBase['value'] === null
+                ? ['value' => null, 'converted' => true]
+                : ['value' => $marketInBase['value'] - $costInBase['value'], 'converted' => true];
 
             // 換算不了不等於金額是 0，但 0 換成任何幣別都還是 0，不需要匯率：只有真的帶著金額的
             // 換算失敗，才會讓下面那些記帳幣別的合計變成一半的數。
-            $dropped = static fn (array $conv, float $native): bool => $conv['value'] === null && $native !== 0.0;
-            $costDropped = $dropped($costInBase, (float) $row['cost_basis']);
-            $realDropped = $dropped($realInBase, (float) $row['realized']);
-            if ($costDropped || $realDropped) {
-                $missingFx[$row['native']] = true;
-            }
+            $costDropped = $costInBase['dropped'];
+            $realDropped = $realInBase['dropped'];
 
             $rows[$i]['base_cost_basis'] = $costInBase['value'];
             $rows[$i]['base_unrealized'] = $unrInBase['value'];
@@ -556,9 +699,11 @@ final class Positions
                 'base'             => $base,
                 'market_value'     => $allConverted ? $totalBase : null,
                 'cost_basis'       => $costBaseUnknown ? null : $totalCostBase,
-                'unrealized'       => $allConverted ? $totalUnrealBase : null,
+                'unrealized'       => $allConverted && !$costBaseUnknown ? $totalUnrealBase : null,
                 'realized'         => $realBaseUnknown ? null : $totalRealBase,
-                'total_gain'       => $allConverted && !$realBaseUnknown ? $totalUnrealBase + $totalRealBase : null,
+                'total_gain'       => $allConverted && !$costBaseUnknown && !$realBaseUnknown
+                    ? $totalUnrealBase + $totalRealBase
+                    : null,
                 'complete'         => $allConverted,
                 'open_positions'   => count(array_filter($rows, static fn (array $r): bool => $r['is_open'])),
                 'closed_positions' => count(array_filter($rows, static fn (array $r): bool => !$r['is_open'])),
@@ -638,13 +783,16 @@ final class Positions
 
         // The trade legs come out of the same walk that costs the holdings, so both columns agree about
         // how much was really sold. Summing the transaction rows here would also hand back the proceeds
-        // of an oversell, which is value that never existed.
+        // of an oversell, which is value that never existed. Each leg keeps its own settlement currency;
+        // the instrument's current currency is only a fallback for legacy blank transaction currencies.
         foreach ($books as $book) {
             foreach ($book as $pos) {
-                $merge((string) $pos['instrument']['currency'], [
-                    'trade_in'  => (float) $pos['cash_in'],
-                    'trade_out' => (float) $pos['cash_out'],
-                ]);
+                foreach ($pos['cash_in_by_currency'] as $currency => $amount) {
+                    $merge((string) $currency, ['trade_in' => (float) $amount]);
+                }
+                foreach ($pos['cash_out_by_currency'] as $currency => $amount) {
+                    $merge((string) $currency, ['trade_out' => (float) $amount]);
+                }
             }
         }
 
@@ -656,7 +804,9 @@ final class Positions
                 $r['deposit_in'] + $r['trade_in'] - $r['withdraw_out'] - $r['trade_out'],
                 '現金餘額'
             );
-            $conv = convert($balance, $currency, $base, $fxCache);
+            $conv = $balance === 0.0
+                ? ['value' => 0.0, 'converted' => true]
+                : convert($balance, $currency, $base, $fxCache);
             if ($conv['converted']) {
                 $totalBase = self::finite($totalBase + (float) $conv['value'], '現金合計');
             } else {

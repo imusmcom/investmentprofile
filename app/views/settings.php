@@ -35,8 +35,13 @@
                placeholder="https://yahoo-proxy.…workers.dev">
       </label>
       <label class="field" style="margin-top:12px">轉接位址的存取金鑰（選填）
-        <input type="password" name="quote_token" value="<?= e($quoteToken) ?>" autocomplete="new-password"
+        <input type="password" name="quote_token" autocomplete="new-password"
                placeholder="Worker 那邊設的 QUOTE_TOKEN">
+        <span class="hint">留空＝保留目前的金鑰；填寫新值＝更換。現有金鑰不會顯示在畫面上。</span>
+      </label>
+      <label class="field" style="margin-top:8px">
+        <input type="checkbox" name="clear_quote_token" value="1">
+        明確清除目前金鑰（勾選時請將上方金鑰欄位留空）
       </label>
       <label class="field" style="margin-top:12px">單次網頁報價更新時間上限（秒）
         <input type="number" name="quote_refresh_budget" min="5" max="600" step="1"

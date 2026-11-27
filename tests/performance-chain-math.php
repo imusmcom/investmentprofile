@@ -14,6 +14,7 @@ putenv('PORTFOLIO_DATA_DIR=' . $dir);
 require __DIR__ . '/../app/bootstrap.php';
 
 use App\Database;
+use App\Handlers;
 use App\Performance;
 use App\Positions;
 use App\Settings;
@@ -57,6 +58,7 @@ final class ReplayCountingPdo extends PDO
 
 $chain = new ReflectionMethod(Performance::class, 'chain');
 $ret = static fn (array $values, array $flows, int $from = 0): mixed => $chain->invoke(null, $values, $flows, $from, count($values) - 1);
+$retCash = static fn (array $values, array $flows, int $from = 0): mixed => $chain->invoke(null, $values, $flows, $from, count($values) - 1, true);
 
 echo "-- 純鏈結算式\n";
 $r = $ret([1000.0, 2000.0, 2200.0], [0.0, 1000.0, 0.0]);
@@ -71,6 +73,31 @@ $r = $ret([0.0, 100.0, 150.0], [0.0, 0.0, 0.0]);
 $ok('基值小於等於零時略過整段，不把後面 50% 冒充全期間報酬', $r === null, var_export($r, true));
 $r = $ret([-10.0, 0.0, 20.0], [0.0, 0.0, 0.0]);
 $ok('整段都沒有可計算基值時回 null', $r === null, var_export($r, true));
+$r = $retCash([1000.0, 0.0, 0.0], [0.0, -1000.0, 0.0]);
+$ok('現金全部買進後，本金流出與零餘額相抵，現金報酬為 0%', is_float($r) && $near($r, 0.0), var_export($r, true));
+$r = $retCash([0.0, 1000.0, 1000.0], [0.0, 1000.0, 0.0]);
+$ok('賣出回到現金的本金不算收益，後續零變動仍為 0%', is_float($r) && $near($r, 0.0), var_export($r, true));
+$r = $retCash([1000.0, 895.0], [0.0, -100.0]);
+$ok('買進本金 100 與手續費 5 分開，現金報酬為 -0.5%', is_float($r) && $near($r, -0.5), var_export($r, true));
+$r = $retCash([-100.0, -100.0], [0.0, 0.0]);
+$ok('負現金沒有可計算基值，不冒充 0%', $r === null, var_export($r, true));
+$r = $retCash([100.0, -50.0], [0.0, 0.0]);
+$ok('現金在期間內轉負時回報未知，不顯示小於 -100% 的假報酬', $r === null, var_export($r, true));
+$r = $ret([0.0, 0.0], [0.0, 0.0]);
+$ok('一般 chain 呼叫的零基值規則保持原樣，不因現金慣例而放寬', $r === null, var_export($r, true));
+$r = $retCash([0.0, 0.0], [0.0, 0.0]);
+$ok('帳戶總值前後都為零且無費用時，合計顯示 0%', is_float($r) && $near($r, 0.0), var_export($r, true));
+$r = $retCash([0.0, 100.0], [0.0, 0.0]);
+$ok('總值由零成長為正數時百分比無定義，仍顯示 --', $r === null, var_export($r, true));
+
+$indexAt = new ReflectionMethod(Performance::class, 'indexAt');
+$testAxis = ['2024-12-31', '2025-01-02', '2025-06-02', '2025-12-31'];
+$ok('起點搜尋取目標日前最後一筆，而不是當年第一筆', $indexAt->invoke(null, $testAxis, '2025-12-30', '2025-12-31') === 2,
+    var_export($indexAt->invoke(null, $testAxis, '2025-12-30', '2025-12-31'), true));
+$ok('起點搜尋也正確處理非年底的中間目標日', $indexAt->invoke(null, $testAxis, '2025-03-01', '2025-12-31') === 1,
+    var_export($indexAt->invoke(null, $testAxis, '2025-03-01', '2025-12-31'), true));
+$ok('目標日早於資料起點時仍回 null', $indexAt->invoke(null, $testAxis, '2024-01-01', '2025-12-31') === null,
+    var_export($indexAt->invoke(null, $testAxis, '2024-01-01', '2025-12-31'), true));
 
 Settings::put('base_currency', 'USD');
 $portfolio = static function (string $name) use ($ok): int {
@@ -88,16 +115,16 @@ $instrument = static function (string $symbol) use ($ok): int {
     $ok("建立 scratch 投資物：{$symbol}", $id > 0, (string) $id);
     return $id;
 };
-$trade = static function (int $pid, int $iid, string $side, string $date, float $qty, float $price, float $fee = 0.0): void {
+$trade = static function (int $pid, int $iid, string $side, string $date, float $qty, float $price, float $fee = 0.0, string $currency = 'USD'): void {
     Database::run(
-        'INSERT INTO transactions (portfolio_id,instrument_id,side,traded_on,quantity,price,fee) VALUES (?,?,?,?,?,?,?)',
-        [$pid, $iid, $side, $date, $qty, $price, $fee]
+        'INSERT INTO transactions (portfolio_id,instrument_id,side,traded_on,currency,quantity,price,fee) VALUES (?,?,?,?,?,?,?,?)',
+        [$pid, $iid, $side, $date, $currency, $qty, $price, $fee]
     );
 };
-$price = static function (int $iid, string $date, float $value): void {
+$price = static function (int $iid, string $date, float $value, string $currency = 'USD'): void {
     Database::run(
         'INSERT INTO prices (instrument_id,as_of,close,adj_close,currency,source) VALUES (?,?,?,?,?,?)',
-        [$iid, $date, $value, $value, 'USD', 'manual']
+        [$iid, $date, $value, $value, $currency, 'manual']
     );
 };
 $today = new DateTimeImmutable('today');
@@ -193,6 +220,390 @@ foreach ($report['periods'] as $row) {
 }
 $ok('同日存入＋買進的公開回報，持股與總報酬都為 10%', $one !== null
     && $near((float) $one['holdings_pct'], 10.0) && $near((float) $one['total_pct'], 10.0), var_export($one, true));
+$ok('同日存入＋買進後現金為零，公開回報仍為 0%', $one !== null
+    && $near((float) $one['cash_pct'], 0.0), var_export($one, true));
+
+echo "-- 公開 API：天數期間起點\n";
+$pid = $portfolio('七天起點');
+$iid = $instrument('SEVENDAY');
+$weekStart = $today->modify('-10 day')->format('Y-m-d');
+$weekBase = $today->modify('-8 day')->format('Y-m-d');
+$weekMid = $today->modify('-6 day')->format('Y-m-d');
+$trade($pid, $iid, 'BUY', $weekStart, 1.0, 100.0);
+$price($iid, $weekStart, 100.0);
+$price($iid, $weekBase, 101.0);
+$price($iid, $weekMid, 102.0);
+$price($iid, $day3, 103.0);
+$report = Performance::forPortfolios([$pid]);
+$seven = null;
+foreach ($report['periods'] as $row) {
+    if ($row['label'] === '7 天') {
+        $seven = $row;
+        break;
+    }
+}
+$ok('7 天起點是期末往前 7 天，不是往前 7 個月', $seven !== null
+    && $seven['start'] === $weekBase && $seven['end'] === $day3, var_export($seven, true));
+
+echo "-- 公開 API：現金本金與手續費\n";
+$pid = $portfolio('現金手續費');
+$iid = $instrument('CASHFEE');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',1000,'USD')", [$pid, $day1]);
+$price($iid, $day1, 100.0);
+$trade($pid, $iid, 'BUY', $day2, 1.0, 100.0, 5.0);
+$price($iid, $day2, 100.0);
+$report = Performance::forPortfolios([$pid]);
+$one = null;
+foreach ($report['periods'] as $row) {
+    if ($row['label'] === '1 天') {
+        $one = $row;
+        break;
+    }
+}
+$ok('期間內買進只移走本金，手續費讓現金報酬為 -0.5%', $one !== null
+    && $near((float) $one['cash_pct'], -0.5), var_export($one, true));
+$ok('同一筆手續費也反映在總報酬，持股本身仍為 0%', $one !== null
+    && $near((float) $one['holdings_pct'], 0.0) && $near((float) $one['total_pct'], -0.5), var_export($one, true));
+
+$pid = $portfolio('閒置現金');
+$iid = $instrument('IDLECASH');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',2000,'USD')", [$pid, '2025-01-02']);
+$trade($pid, $iid, 'BUY', '2025-01-02', 10.0, 100.0);
+$price($iid, '2025-01-02', 100.0);
+$price($iid, '2025-06-02', 150.0);
+$report = Performance::forPortfolios([$pid]);
+$year = null;
+foreach ($report['years'] as $row) {
+    if ((string) $row['label'] === '2025') {
+        $year = $row;
+        break;
+    }
+}
+$ok('年度閒置現金沒有流入流出與費用時為 0%', $year !== null
+    && $near((float) $year['cash_pct'], 0.0), var_export($year, true));
+
+echo "-- 公開 API：存入與提取計入現金及合計報酬\n";
+$pid = $portfolio('本金計入報酬');
+$iid = $instrument('PRINCIPALRETURN');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',2000,'USD')", [$pid, '2025-01-02']);
+$trade($pid, $iid, 'BUY', '2025-01-02', 10.0, 100.0);
+$price($iid, '2025-01-02', 100.0);
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',100,'USD')", [$pid, '2025-06-02']);
+$price($iid, '2025-06-02', 150.0);
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'OUT',50,'USD')", [$pid, '2025-12-31']);
+$price($iid, '2025-12-31', 150.0);
+$report = Performance::forPortfolios([$pid]);
+$year = null;
+$one = null;
+foreach ($report['years'] as $row) {
+    if ((string) $row['label'] === '2025') {
+        $year = $row;
+        break;
+    }
+}
+foreach ($report['periods'] as $row) {
+    if ($row['label'] === '1 天') {
+        $one = $row;
+        break;
+    }
+}
+$ok('年度現金存入 100、提取 50 後，報酬為 +5%', $year !== null
+    && $near((float) $year['cash_pct'], 5.0), var_export($year, true));
+$ok('年度合計把存入 100、提取 50 全額計入，報酬為 +27.5%', $year !== null
+    && $near((float) $year['total_pct'], 27.5), var_export($year, true));
+$ok('持股仍排除本金流動，年度 TWR 保持 +50%', $year !== null
+    && $near((float) $year['holdings_pct'], 50.0), var_export($year, true));
+$ok('期間提取 50 讓現金報酬轉負，而不是剔除成 0%', $one !== null
+    && $near((float) $one['cash_pct'], -50.0 / 1100.0 * 100.0), var_export($one, true));
+$ok('期間合計也把提取 50 計入負報酬', $one !== null
+    && $near((float) $one['total_pct'], -50.0 / 2600.0 * 100.0), var_export($one, true));
+
+echo "-- 公開 API：年度起點必須接前一年年底\n";
+$pid = $portfolio('跨年起點');
+$iid = $instrument('YEARSTART');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',100,'USD')", [$pid, '2024-12-31']);
+$trade($pid, $iid, 'BUY', '2024-12-31', 1.0, 100.0);
+$price($iid, '2024-12-31', 100.0);
+$price($iid, '2025-12-31', 120.0);
+$report = Performance::forPortfolios([$pid]);
+$year = null;
+foreach ($report['years'] as $row) {
+    if ((string) $row['label'] === '2025') {
+        $year = $row;
+        break;
+    }
+}
+$ok('2025 年度起點接上 2024-12-31，不從當年第一筆重來', $year !== null
+    && $year['start'] === '2024-12-31', var_export($year, true));
+$ok('跨年起點正確後持股、現金、合計分別為 20%、0%、20%', $year !== null
+    && $near((float) $year['holdings_pct'], 20.0) && $near((float) $year['cash_pct'], 0.0)
+    && $near((float) $year['total_pct'], 20.0), var_export($year, true));
+
+echo "-- 公開 API：YTD 接上一年最後價\n";
+$pid = $portfolio('YTD跨年');
+$iid = $instrument('YTDBOUNDARY');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',100,'USD')", [$pid, '2024-12-31']);
+$trade($pid, $iid, 'BUY', '2024-12-31', 1.0, 100.0);
+$price($iid, '2024-12-31', 100.0);
+$price($iid, '2025-01-01', 110.0);
+$price($iid, '2025-12-31', 120.0);
+$report = Performance::forPortfolios([$pid]);
+$ytd = null;
+foreach ($report['periods'] as $row) {
+    if ($row['label'] === '本年至今') {
+        $ytd = $row;
+        break;
+    }
+}
+$ok('YTD 起點是前一年 12/31，包含 1/1 當日漲跌', $ytd !== null
+    && $ytd['start'] === '2024-12-31' && $near((float) $ytd['total_pct'], 20.0), var_export($ytd, true));
+
+echo "-- 公開 API：純現金與最後報價後事件\n";
+$pid = $portfolio('純現金');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',1000,'USD')", [$pid, '2025-01-02']);
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',100,'USD')", [$pid, '2025-12-31']);
+$report = Performance::forPortfolios([$pid]);
+$year = null;
+foreach ($report['years'] as $row) {
+    if ((string) $row['label'] === '2025') {
+        $year = $row;
+        break;
+    }
+}
+$ok('沒有交易與投資物的純現金組合仍可計算', $year !== null
+    && $year['start'] === '2025-01-02' && $near((float) $year['cash_pct'], 10.0)
+    && $near((float) $year['total_pct'], 10.0) && $report['meta']['missing_price'] === [], var_export($report, true));
+$ok('純現金端點不會被標成陳舊', $report['meta']['stale'] === false
+    && $report['meta']['price_end'] === null, var_export($report['meta'], true));
+
+$pid = $portfolio('報價後存入');
+$iid = $instrument('POSTPRICE');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',100,'USD')", [$pid, $day1]);
+$trade($pid, $iid, 'BUY', $day1, 1.0, 100.0);
+$price($iid, $day1, 100.0);
+$price($iid, $day2, 110.0);
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',50,'USD')", [$pid, $day3]);
+$report = Performance::forPortfolios([$pid]);
+$one = null;
+foreach ($report['periods'] as $row) {
+    if ($row['label'] === '1 天') {
+        $one = $row;
+        break;
+    }
+}
+$ok('最後報價後的存入進入期末現金與總值', $report['meta']['end'] === $day3
+    && $report['meta']['price_end'] === $day2 && $report['meta']['stale'] === true
+    && abs((float) $report['meta']['end_cash'] - 50.0) < 0.000001
+    && abs((float) $report['meta']['end_total'] - 160.0) < 0.000001, var_export($report['meta'], true));
+$ok('陳舊報價事件日仍可計算區間並附註', $one !== null && $one['stale_end'] === true
+    && $near((float) $one['total_pct'], 50.0 / 110.0 * 100.0)
+    && str_contains($one['note'], '最後已知價'), var_export($one, true));
+
+echo "-- 公開 API：混合新舊報價與無持股端點\n";
+$pid = $portfolio('混合報價新舊');
+$fresh = $instrument('FRESHMIX');
+$stale = $instrument('STALEMIX');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',2000,'USD')", [$pid, $day1]);
+$trade($pid, $fresh, 'BUY', $day1, 1.0, 100.0);
+$trade($pid, $stale, 'BUY', $day1, 1.0, 100.0);
+$price($fresh, $day1, 100.0);
+$price($fresh, $day2, 110.0);
+$price($fresh, $day3, 120.0);
+$price($stale, $day1, 100.0);
+$price($stale, $day2, 105.0);
+$report = Performance::forPortfolios([$pid]);
+$one = null;
+foreach ($report['periods'] as $row) {
+    if ($row['label'] === '1 天') {
+        $one = $row;
+        break;
+    }
+}
+$ok('新投資物的當日價不會掩蓋另一投資物的陳舊價', $report['meta']['end'] === $day3
+    && $report['meta']['price_end'] === $day2 && $report['meta']['stale'] === true
+    && abs((float) $report['meta']['end_holdings'] - 225.0) < 0.000001
+    && $one !== null && $one['stale_end'] === true
+    && str_contains($one['note'], '最後已知價'), var_export($report, true));
+
+$pid = $portfolio('端點已清倉');
+$iid = $instrument('NOENDINGHOLD');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',1000,'USD')", [$pid, $day1]);
+$trade($pid, $iid, 'BUY', $day1, 1.0, 100.0);
+$price($iid, $day1, 100.0);
+$trade($pid, $iid, 'SELL', $day2, 1.0, 100.0);
+$price($iid, $day2, 100.0);
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',10,'USD')", [$pid, $day3]);
+$report = Performance::forPortfolios([$pid]);
+$one = null;
+foreach ($report['periods'] as $row) {
+    if ($row['label'] === '1 天') {
+        $one = $row;
+        break;
+    }
+}
+$ok('已清倉端點即使現金事件晚於最後報價也不算陳舊', $report['meta']['end'] === $day3
+    && $report['meta']['end_holdings'] === 0.0 && $report['meta']['price_end'] === null
+    && $report['meta']['stale'] === false && $one !== null && $one['stale_end'] === false,
+    var_export($report, true));
+
+echo "-- 公開 API：歷史幣別不被目前幣別重寫\n";
+$pid = $portfolio('歷史幣別');
+$iid = $instrument('HISTCUR');
+Database::run("INSERT INTO fx_rates (currency,units_per_usd,as_of,source,manual) VALUES ('HKD',10,'2026-11-24','manual',1)
+               ON CONFLICT(currency) DO UPDATE SET units_per_usd=excluded.units_per_usd");
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',1000,'HKD')", [$pid, '2025-01-02']);
+$trade($pid, $iid, 'BUY', '2025-01-02', 1.0, 100.0, 0.0, 'HKD');
+$price($iid, '2025-01-02', 100.0, 'HKD');
+$price($iid, '2025-06-02', 2.0, 'USD');
+Database::run('UPDATE instruments SET currency = ? WHERE id = ?', ['HKD', $iid]);
+$report = Performance::forPortfolios([$pid]);
+$year = null;
+foreach ($report['years'] as $row) {
+    if ((string) $row['label'] === '2025') {
+        $year = $row;
+        break;
+    }
+}
+$ok('歷史價格與成交各自使用保存的幣別，持股 -80%、合計 -8%', $year !== null
+    && $near((float) $year['holdings_pct'], -80.0) && $near((float) $year['total_pct'], -8.0), var_export($year, true));
+$positions = Positions::forPortfolio($pid);
+$row = $positions['rows'][0] ?? null;
+$cash = Positions::cashFor($pid);
+$cashRows = [];
+foreach ($cash['rows'] as $cashRow) {
+    $cashRows[$cashRow['currency']] = $cashRow;
+}
+$ok('Positions 估值取價格列 USD，成交成本與現金仍為 HKD', $row !== null
+    && $row['valuation_currency'] === 'USD'
+    && $near((float) $row['recorded_cost_basis'], 100.0)
+    && $near((float) $row['cost_basis'], 10.0)
+    && $near((float) $row['base_cost_basis'], 10.0)
+    && $near((float) $row['market_value'], 2.0)
+    && $near((float) $row['base_unrealized'], -8.0)
+    && ($cashRows['HKD']['trade_out'] ?? null) === 100.0
+    && $near((float) ($cashRows['HKD']['base_value'] ?? 0.0), 90.0)
+    && !isset($cashRows['USD']), var_export(['positions' => $positions, 'cash' => $cash], true));
+
+echo "-- Positions：投資物改幣別不重寫歷史成交\n";
+$pid = $portfolio('歷史 USD 成交');
+$iid = $instrument('USDEURTRADE');
+Database::run("INSERT INTO fx_rates (currency,units_per_usd,as_of,source,manual) VALUES ('EUR',2,'2026-11-24','manual',1)
+               ON CONFLICT(currency) DO UPDATE SET units_per_usd=excluded.units_per_usd");
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',1000,'USD')", [$pid, $day1]);
+$trade($pid, $iid, 'BUY', $day1, 1.0, 100.0, 5.0, 'USD');
+Database::run('UPDATE instruments SET currency = ? WHERE id = ?', ['EUR', $iid]);
+$price($iid, $day3, 120.0, 'EUR');
+$positions = Positions::forPortfolio($pid);
+$row = $positions['rows'][0] ?? null;
+$cash = Positions::cashFor($pid);
+$cashRows = [];
+foreach ($cash['rows'] as $cashRow) {
+    $cashRows[$cashRow['currency']] = $cashRow;
+}
+$ok('USD 成交成本保留，EUR 現價與 USD 記帳成本分開換算', $row !== null
+    && $row['valuation_currency'] === 'EUR'
+    && $near((float) $row['recorded_cost_basis'], 105.0)
+    && $near((float) $row['cost_basis'], 210.0)
+    && $near((float) $row['base_cost_basis'], 105.0)
+    && $near((float) $row['market_value'], 120.0)
+    && $near((float) $row['base_market_value'], 60.0)
+    && $near((float) $row['base_unrealized'], -45.0)
+    && ($cashRows['USD']['trade_out'] ?? null) === 105.0
+    && $near((float) ($cashRows['USD']['balance'] ?? 0.0), 895.0)
+    && $near((float) $cash['total_base'], 895.0)
+    && !isset($cashRows['EUR']), var_export(['positions' => $positions, 'cash' => $cash], true));
+
+$trade($pid, $iid, 'SELL', $day3, 1.0, 130.0, 0.0, 'EUR');
+$positions = Positions::forPortfolio($pid);
+$row = $positions['rows'][0] ?? null;
+$cash = Positions::cashFor($pid);
+$cashRows = [];
+foreach ($cash['rows'] as $cashRow) {
+    $cashRows[$cashRow['currency']] = $cashRow;
+}
+$report = Performance::forPortfolios([$pid]);
+$ok('後續 EUR 賣出以 USD 歷史成本計算已實現與合計現金', $row !== null
+    && $row['is_open'] === false
+    && $near((float) $row['base_cost_basis'], 0.0)
+    && $near((float) $row['base_realized'], -40.0)
+    && $near((float) ($positions['summary']['realized'] ?? 0.0), -40.0)
+    && ($cashRows['EUR']['trade_in'] ?? null) === 130.0
+    && $near((float) ($cashRows['EUR']['base_value'] ?? 0.0), 65.0)
+    && $near((float) $cash['total_base'], 960.0)
+    && $near((float) $report['meta']['end_cash'], 960.0),
+    var_export(['positions' => $positions, 'cash' => $cash, 'report' => $report], true));
+
+Database::run("DELETE FROM fx_rates WHERE currency = 'EUR'");
+$positions = Positions::forPortfolio($pid);
+$row = $positions['rows'][0] ?? null;
+$ok('已出清的零成本與零市值不需要匯率，不會誤標成未知', $row !== null
+    && $row['cost_basis'] === 0.0 && $row['base_cost_basis'] === 0.0
+    && $row['base_market_value'] === 0.0 && $positions['summary']['cost_basis'] === 0.0,
+    var_export($positions, true));
+Database::run("INSERT INTO fx_rates (currency,units_per_usd,as_of,source,manual)
+               VALUES ('EUR',2,'2026-11-24','manual',1)
+               ON CONFLICT(currency) DO UPDATE SET units_per_usd=excluded.units_per_usd");
+
+$pid = $portfolio('缺匯率歷史幣別');
+$iid = $instrument('JPYCHANGE');
+$trade($pid, $iid, 'BUY', $day1, 1.0, 100.0, 5.0, 'JPY');
+Database::run('UPDATE instruments SET currency = ? WHERE id = ?', ['EUR', $iid]);
+$price($iid, $day3, 120.0, 'EUR');
+$positions = Positions::forPortfolio($pid);
+$row = $positions['rows'][0] ?? null;
+$ok('缺匯率只列出真正缺少的歷史幣別，不誤報目前估值幣別', $row !== null
+    && $row['cost_basis'] === null && $positions['summary']['cost_basis'] === null
+    && $positions['summary']['missing_fx'] === ['JPY']
+    && $near((float) $row['base_market_value'], 60.0), var_export($positions, true));
+
+echo "-- 公開 API：合計相加溢位\n";
+$pid = $portfolio('合計溢位');
+$iid = $instrument('SUMOVERFLOW');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',1e308,'USD')", [$pid, '2025-01-02']);
+$trade($pid, $iid, 'BUY', '2025-01-02', 1.0, 1e308);
+$price($iid, '2025-01-02', 1e308);
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',1e308,'USD')", [$pid, '2025-12-31']);
+$price($iid, '2025-12-31', 1e308);
+$report = Performance::forPortfolios([$pid]);
+$ok('兩個各自有限值的持股與現金相加溢位時整份回報略過', $report['periods'] === []
+    && str_contains((string) $report['meta']['note'], '合計超出'), var_export($report, true));
+
+echo "-- 公開 API：缺價時各欄獨立判斷\n";
+$pid = $portfolio('缺價分欄');
+$priced = $instrument('LATEPRICE');
+$other = $instrument('PARTIALB');
+Database::run("INSERT INTO cash_movements (portfolio_id,moved_on,direction,amount,currency) VALUES (?,?,'IN',4000,'USD')", [$pid, '2025-01-02']);
+$trade($pid, $other, 'BUY', '2025-01-02', 10.0, 100.0);
+$trade($pid, $priced, 'BUY', '2025-01-03', 10.0, 100.0);
+$price($other, '2025-01-02', 100.0);
+$price($other, '2025-01-03', 100.0);
+$price($other, '2025-01-04', 100.0);
+$price($priced, '2025-01-04', 150.0);
+$report = Performance::forPortfolios([$pid]);
+$year = null;
+$one = null;
+foreach ($report['years'] as $row) {
+    if ((string) $row['label'] === '2025') {
+        $year = $row;
+        break;
+    }
+}
+foreach ($report['periods'] as $row) {
+    if ($row['label'] === '1 天') {
+        $one = $row;
+        break;
+    }
+}
+$ok('年度期中新持股缺價時持股 TWR 仍為 --', $year !== null
+    && $year['holdings_pct'] === null, var_export($year, true));
+$ok('年度中間缺價不影響現金，買進本金剔除後仍為 0%', $year !== null
+    && $near((float) $year['cash_pct'], 0.0), var_export($year, true));
+$ok('年度期初與期末完整時，合計仍算出 12.5%', $year !== null
+    && $near((float) $year['total_pct'], 500.0 / 4000.0 * 100.0), var_export($year, true));
+$ok('期間起點缺價時合計為 --，不拿不完整基值硬算', $one !== null
+    && $one['total_pct'] === null && $one['start'] === '2025-01-03', var_export($one, true));
+$ok('期間起點缺價也不影響現金欄', $one !== null
+    && $near((float) $one['cash_pct'], 0.0), var_export($one, true));
 
 echo "-- 公開 API：賣超截斷與手續費符號\n";
 $pid = $portfolio('賣超與手續費');
@@ -247,8 +658,8 @@ foreach ($report['years'] as $row) {
         break;
     }
 }
-$ok('無價格日的存入只抵銷下一期一次，不會重複扣成負報酬', $year !== null
-    && $near((float) $year['total_pct'], 0.0), var_export($year, true));
+$ok('無價格日的存入併入下一有價日，合計全額計入而為 10%', $year !== null
+    && $near((float) $year['total_pct'], 10.0), var_export($year, true));
 
 echo "-- 無價格事件與截止日事件軸\n";
 $ok('3 月 31 日減一個月落在 2 月最後一天', App\Calendar::subtractMonths('2024-03-31', 1) === '2024-02-29', App\Calendar::subtractMonths('2024-03-31', 1));
@@ -485,6 +896,30 @@ $ok('讀取回呼例外會回滾交易且不留下半筆寫入',
     $snapshotFailure === 'injected snapshot failure' && !Database::pdo()->inTransaction()
     && Database::scalar('SELECT name FROM portfolios WHERE id = ?', [$pid]) === $after,
     'failure=' . $snapshotFailure);
+
+echo "-- 總覽幣別小計與合計溢位\n";
+$breakdown = new ReflectionMethod(Handlers::class, 'currencyBreakdown');
+$summary = ['by_currency' => [
+    ['currency' => 'USD', 'unpriced' => 0, 'market_value' => 1e308, 'base_ok' => true, 'base_market_value' => 1e308],
+    ['currency' => 'HKD', 'unpriced' => 0, 'market_value' => 1e308, 'base_ok' => true, 'base_market_value' => 1e308],
+]];
+$cash = ['base' => 'TWD', 'rows' => []];
+$result = $breakdown->invoke(null, $summary, $cash);
+$ok('總覽跨幣別小計相加溢位時合計顯示未知', $result['total_base'] === null, json_encode($result));
+$summary['by_currency'] = [
+    ['currency' => 'USD', 'unpriced' => 0, 'market_value' => 1e308, 'base_ok' => true, 'base_market_value' => 1e308],
+];
+$cash['rows'] = [
+    ['currency' => 'USD', 'balance' => 1e308, 'base_ok' => true, 'base_value' => 1e308],
+];
+$result = $breakdown->invoke(null, $summary, $cash);
+$ok('總覽同幣別持股加現金溢位時該列與合計留未知', $result['rows'][0]['base_value'] === null
+    && $result['total_base'] === null, json_encode($result));
+$summary['by_currency'][0]['base_market_value'] = 100.0;
+$cash['rows'][0]['base_value'] = 30.0;
+$result = $breakdown->invoke(null, $summary, $cash);
+$ok('總覽有限幣別小計仍正常相加', $result['rows'][0]['base_value'] == 130.0
+    && $result['total_base'] == 130.0, json_encode($result));
 
 echo $fail === 0 ? "PERFORMANCE CHAIN ALL PASS\n" : "PERFORMANCE CHAIN FAILURES: {$fail}\n";
 exit($fail === 0 ? 0 : 1);

@@ -57,7 +57,6 @@ function asset(string $path): string
 
 function current_portfolio_id(): int
 {
-    $first = (int) Database::scalar('SELECT MIN(id) FROM portfolios', [], 0);
     $session = (int) ($_SESSION['portfolio_id'] ?? 0);
 
     if ($session > 0) {
@@ -67,7 +66,7 @@ function current_portfolio_id(): int
         }
     }
 
-    return $first;
+    return (int) Database::scalar('SELECT MIN(id) FROM portfolios', [], 0);
 }
 
 function csrf_token(): string
